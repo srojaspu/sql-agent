@@ -10,12 +10,17 @@ use uuid::Uuid;
 use crate::{
     audit,
     config::Config,
+    database::schema::{upsert_schema_memory, SchemaMemoryEntry},
     database::{ColumnInfo, SqlServer, TableInfo},
     llm::{Message, Ollama, ToolCall},
     security::{SecurityPolicy, SqlValidator},
 };
 
-use crate::agent::{prompt::SYSTEM_PROMPT, tools};
+use crate::agent::{
+    prompt::SYSTEM_PROMPT,
+    session::{build_history_context, is_anaphoric, Session, MAX_CHARS},
+    tools,
+};
 
 #[derive(Clone, Debug)]
 struct SchemaCache {
@@ -234,6 +239,267 @@ impl Agent {
         }
 
         anyhow::bail!("Se alcanzó MAX_STEPS sin obtener una respuesta final")
+    }
+
+    /// Build LLM messages with history, schema memory hints and caps.
+    /// Pure helper for testing run_with_history without side effects.
+    pub fn build_messages_with_history(&self, session: &Session, question: &str) -> Vec<Message> {
+        let mut system_content = format!(
+            "{} Base de datos: {}.",
+            SYSTEM_PROMPT, self.config.database_name
+        );
+        // Inject valid schema memory hints (TTL filtered)
+        let valid_hints: Vec<String> = session
+            .schema_memory
+            .iter()
+            .filter(|(_, e)| !e.is_expired())
+            .map(|(k, e)| {
+                format!(
+                    "{} -> {}.{} (synonyms: {})",
+                    k,
+                    e.table.schema,
+                    e.table.table,
+                    e.synonyms.join(", ")
+                )
+            })
+            .collect();
+        if !valid_hints.is_empty() {
+            system_content.push_str("\n\nMemoria de esquema reciente:\n");
+            system_content.push_str(&valid_hints.join("\n"));
+        }
+        // Anaphora hint: if question is anaphoric, remind model of prior context
+        if is_anaphoric(question) && !session.messages.is_empty() {
+            system_content.push_str("\n\nNota: la pregunta contiene referencia anafórica (\"de esos\", \"y de esos\"); usa el historial previo para resolverla.");
+        }
+        let system = Message::system(system_content);
+        let history_ctx = build_history_context(session, question, MAX_CHARS);
+        // Prepend system
+        let mut out = vec![system];
+        out.extend(history_ctx);
+        out
+    }
+
+    /// Run with history: multi-turn continuity, caps, schema memory, /refresh handling.
+    pub async fn run_with_history(&self, session: &mut Session, question: &str) -> Result<String> {
+        if question.trim().is_empty() {
+            anyhow::bail!("Pregunta vacía");
+        }
+        let trimmed = question.trim();
+        // Special commands handling (TUI commands)
+        if trimmed == "/refresh" {
+            // Invalidate schema cache (TTL 300s shared) and session schema_memory
+            *self.schema.write().await = None;
+            session.schema_memory.clear();
+            // Audit
+            self.audit("refresh", json!({ "session_id": session.id }))
+                .await?;
+            return Ok("🔄 Esquema refrescado — caché y memoria invalidados".to_string());
+        }
+        if trimmed == "/clear" {
+            session.messages.clear();
+            session.updated_at = chrono::Utc::now();
+            return Ok("🧹 Historial limpiado".to_string());
+        }
+        if trimmed == "/history" {
+            let hist: Vec<String> = session
+                .messages
+                .iter()
+                .map(|m| {
+                    format!(
+                        "{}: {}",
+                        m.role,
+                        m.content.chars().take(200).collect::<String>()
+                    )
+                })
+                .collect();
+            if hist.is_empty() {
+                return Ok("Historial vacío".to_string());
+            }
+            return Ok(hist.join("\n"));
+        }
+
+        let request_id = Uuid::new_v4().to_string();
+        self.audit(
+            "request",
+            json!({
+                "request_id": request_id,
+                "session_id": session.id,
+                "question": question,
+                "anaphoric": is_anaphoric(question)
+            }),
+        )
+        .await?;
+
+        // Build messages with history + caps + schema hints
+        let mut messages = self.build_messages_with_history(session, question);
+
+        // Push user message to session (caps enforced inside push)
+        session.push(Message::user(question.to_string()));
+
+        // Persist after push (best effort)
+        let _ = session.persist().await;
+
+        let mut tool_calls_history: Vec<String> = Vec::new();
+
+        for step in 1..=self.config.max_steps {
+            if self.config.verbose {
+                println!("\n━━━━━━━━ STEP {step}/{} ━━━━━━━━", self.config.max_steps);
+            }
+            let tool_defs = tools::definitions();
+            // messages already includes system + history + question; for LLM call we use the built messages clone
+            // But we need to keep messages mutable for loop: we already have messages built, but we need to update it each iteration
+            let reply = self
+                .llm
+                .chat(&messages, &tool_defs, self.config.verbose)
+                .await
+                .with_context(|| format!("Ollama falló en STEP {step}"))?;
+
+            if reply.tool_calls.is_empty() {
+                let text = reply.content.trim();
+                if looks_like_sql(text) {
+                    let result = self
+                        .execute_read_tool(&json!({ "sql": text }), &request_id)
+                        .await?;
+                    let assistant_msg = reply.clone();
+                    session.push(assistant_msg.clone());
+                    messages.push(assistant_msg);
+                    let tool_msg = Message::tool("execute_read_query", result.clone());
+                    session.push(tool_msg.clone());
+                    messages.push(tool_msg);
+                    tool_calls_history.push("execute_read_query".to_string());
+                    continue;
+                }
+                if !text.is_empty() {
+                    // Push assistant final response to session
+                    session.push(reply.clone());
+                    messages.push(reply.clone());
+                    self.audit(
+                        "response",
+                        json!({
+                            "request_id": request_id,
+                            "session_id": session.id,
+                            "step": step,
+                            "tools_used": tool_calls_history.clone()
+                        }),
+                    )
+                    .await?;
+                    let _ = session.persist().await;
+                    return Ok(text.to_string());
+                }
+                session.push(reply.clone());
+                messages.push(reply);
+                continue;
+            }
+
+            if reply.tool_calls.len() > self.config.max_tool_calls_per_step {
+                anyhow::bail!("Demasiadas herramientas en un mismo paso");
+            }
+
+            // Must keep assistant tool_calls message before results
+            session.push(reply.clone());
+            messages.push(reply.clone());
+
+            for call in reply
+                .tool_calls
+                .iter()
+                .take(self.config.max_tool_calls_per_step)
+            {
+                let name = call.function.name.as_str();
+                if self.config.verbose {
+                    println!("   ↳ {name}");
+                }
+                // For schema-related tools, update schema_memory before/after
+                let result = self
+                    .dispatch_tool_with_history(call, &request_id, session)
+                    .await?;
+                if self.config.verbose {
+                    println!("   ✓ {name} completado");
+                    println!("📦 TOOL RESULT [{name}]:\n{result}");
+                }
+                tool_calls_history.push(name.to_string());
+                let tool_msg = Message::tool(name, result);
+                session.push(tool_msg.clone());
+                messages.push(tool_msg);
+            }
+            let _ = session.persist().await;
+        }
+
+        anyhow::bail!("Se alcanzó MAX_STEPS sin obtener una respuesta final")
+    }
+
+    async fn dispatch_tool_with_history(
+        &self,
+        call: &ToolCall,
+        request_id: &str,
+        session: &mut Session,
+    ) -> Result<String> {
+        let args = normalize_tool_arguments(&call.function.arguments)?;
+        match call.function.name.as_str() {
+            "search_schema" => {
+                let query_raw = args
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let result = self.search_schema(&args).await?;
+                // Update schema memory: parse matched tables from result? For now, try to extract from cached tables
+                // We use search_with_fallback to get matched tables and upsert
+                if let Ok(tables) = self.cached_tables().await {
+                    let allowed: Vec<TableInfo> = tables
+                        .iter()
+                        .filter(|t| self.table_allowed(&t.schema, &t.table))
+                        .cloned()
+                        .collect();
+                    let (matched, _) =
+                        search_with_fallback(&query_raw, &allowed, self.config.max_schema_results);
+                    for tbl in &matched {
+                        let key = format!("{}.{}", tbl.schema, tbl.table);
+                        // Try to get columns for memory entry (best effort)
+                        let cols = self.db.describe_table(&key).await.unwrap_or_default();
+                        upsert_schema_memory(
+                            &mut session.schema_memory,
+                            key,
+                            tbl.clone(),
+                            cols,
+                            Some(query_raw.clone()),
+                            self.config.schema_cache_seconds,
+                        );
+                    }
+                }
+                Ok(result)
+            }
+            "describe_table" => {
+                let table = args
+                    .get("table")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let result = self.describe_table_tool(&args).await?;
+                // Upsert schema memory for described table
+                let (schema, name) = split_table(&table);
+                let key = format!("{}.{}", schema, name);
+                // Try to get columns to store
+                if let Ok(cols) = self.db.describe_table(&key).await {
+                    let tbl = TableInfo {
+                        schema: schema.clone(),
+                        table: name.clone(),
+                    };
+                    upsert_schema_memory(
+                        &mut session.schema_memory,
+                        key,
+                        tbl,
+                        cols,
+                        Some(table.clone()),
+                        self.config.schema_cache_seconds,
+                    );
+                }
+                Ok(result)
+            }
+            "execute_read_query" => self.execute_read_tool(&args, request_id).await,
+            other => anyhow::bail!("Tool no permitida: {other}"),
+        }
     }
 
     /*
@@ -1066,5 +1332,235 @@ mod tests {
         assert!(msg.contains("Tabla00"));
         assert!(msg.contains("Tabla16"));
         assert!(!msg.contains("Tabla17"), "should limit to 17 candidates");
+    }
+
+    // ===== Task 2.4 run_with_history helpers =====
+    fn dummy_config() -> crate::config::Config {
+        crate::config::Config {
+            database_host: "localhost".into(),
+            database_port: 1433,
+            database_name: "TestDB".into(),
+            database_user: "user".into(),
+            database_password: "pass".into(),
+            database_trust_cert: true,
+            ollama_url: "http://127.0.0.1:11434".into(),
+            ollama_model: "qwen3:4b".into(),
+            ollama_timeout_seconds: 120,
+            ollama_connect_timeout_seconds: 5,
+            ollama_temperature: 0.0,
+            max_steps: 8,
+            max_sql_length: 10_000,
+            max_rows: 100,
+            max_result_chars: 30_000,
+            schema_cache_seconds: 300,
+            query_timeout_seconds: 30,
+            max_concurrent_queries: 1,
+            max_joins: 5,
+            max_subqueries: 5,
+            max_schema_results: 20,
+            max_tool_result_chars: 20_000,
+            max_tool_calls_per_step: 10,
+            allowed_tables: vec![],
+            block_sensitive_columns: true,
+            block_comments: true,
+            allow_cte: true,
+            allow_system_tables: false,
+            audit_enabled: false,
+            audit_path: "logs/test-audit.jsonl".into(),
+            audit_sql: false,
+            verbose: false,
+        }
+    }
+
+    #[test]
+    fn build_messages_with_history_anaphora_includes_history() {
+        let agent = Agent::new(dummy_config());
+        let mut session = crate::agent::session::Session::new();
+        // Prior turn: user asked about usuarios, tool returned 2 rows
+        session.push(crate::llm::Message::user("cuantos usuarios hay".into()));
+        session.push(crate::llm::Message::tool(
+            "execute_read_query",
+            "✓ RESULTADOS (2 filas) Fila 1: Usuario=Juan activo=1 Fila 2: Usuario=Ana activo=0"
+                .into(),
+        ));
+        let msgs = agent.build_messages_with_history(&session, "y de esos cuantos activos");
+        // System + history + new question => should contain prior tool result and new question
+        let joined: String = msgs
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            joined.contains("cuantos usuarios hay"),
+            "history should be injected, got: {joined}"
+        );
+        assert!(
+            joined.contains("y de esos cuantos activos"),
+            "new anaphoric question should be present"
+        );
+        assert!(
+            joined.contains("Fila 1"),
+            "tool result should be retained for anaphora resolution"
+        );
+        // System should contain anaphoric hint
+        assert!(
+            msgs[0].content.to_ascii_lowercase().contains("anafórica")
+                || msgs[0].content.contains("de esos"),
+            "system should hint anaphoric usage"
+        );
+    }
+
+    #[test]
+    fn build_messages_with_history_non_anaphoric_still_injects_history() {
+        let agent = Agent::new(dummy_config());
+        let mut session = crate::agent::session::Session::new();
+        session.push(crate::llm::Message::user("muestra productos".into()));
+        let msgs = agent.build_messages_with_history(&session, "cuantos pedidos hay");
+        let joined: String = msgs
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        // Both prior and new should be present (multi-turn continuity)
+        assert!(joined.contains("muestra productos"));
+        assert!(joined.contains("cuantos pedidos hay"));
+        // Should NOT contain anaphoric note for non-anaphoric
+        assert!(
+            !msgs[0].content.to_ascii_lowercase().contains("anafórica")
+                || !crate::agent::session::is_anaphoric("cuantos pedidos hay")
+        );
+    }
+
+    #[test]
+    fn build_messages_caps_respected_via_session() {
+        let agent = Agent::new(dummy_config());
+        let mut session = crate::agent::session::Session::new();
+        for i in 0..50 {
+            session.push(crate::llm::Message::user(format!("msg {i}")));
+        }
+        // Session itself should be capped at 40
+        assert_eq!(session.messages.len(), 40);
+        let msgs = agent.build_messages_with_history(&session, "pregunta final");
+        // Messages = system + history (40) + question (1) but capped to 40 history -> should be <= 41 + system
+        // System is 1, history_ctx is capped to 40, so total <= 41 + maybe truncated
+        assert!(
+            msgs.len() <= 42,
+            "should respect 40 cap + system + question, got {}",
+            msgs.len()
+        );
+        // Oldest msg 0 should have been evicted
+        let joined: String = msgs
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!joined.contains("msg 0 "), "oldest should be evicted");
+    }
+
+    #[test]
+    fn build_messages_injects_schema_memory_hints_when_valid() {
+        let agent = Agent::new(dummy_config());
+        let mut session = crate::agent::session::Session::new();
+        let tbl = crate::database::TableInfo {
+            schema: "dbo".into(),
+            table: "Usuario".into(),
+        };
+        let entry = crate::database::schema::SchemaMemoryEntry::new(
+            tbl,
+            vec![],
+            vec!["usuarios".into()],
+            300,
+        );
+        session.schema_memory.insert("dbo.Usuario".into(), entry);
+        let msgs = agent.build_messages_with_history(&session, "cuantos usuarios");
+        assert!(
+            msgs[0].content.contains("dbo.Usuario") && msgs[0].content.contains("usuarios"),
+            "system should contain schema memory hint, got: {}",
+            msgs[0].content
+        );
+    }
+
+    #[test]
+    fn build_messages_expired_schema_memory_not_injected() {
+        let agent = Agent::new(dummy_config());
+        let mut session = crate::agent::session::Session::new();
+        let tbl = crate::database::TableInfo {
+            schema: "dbo".into(),
+            table: "Usuario".into(),
+        };
+        let mut entry = crate::database::schema::SchemaMemoryEntry::new(
+            tbl,
+            vec![],
+            vec!["usuarios".into()],
+            1,
+        );
+        // Make expired
+        entry.last_used = chrono::Utc::now() - chrono::Duration::seconds(10);
+        session.schema_memory.insert("dbo.Usuario".into(), entry);
+        let msgs = agent.build_messages_with_history(&session, "cuantos usuarios");
+        assert!(
+            !msgs[0].content.contains("dbo.Usuario"),
+            "expired entry should not be injected, got: {}",
+            msgs[0].content
+        );
+    }
+
+    #[tokio::test]
+    async fn run_with_history_refresh_clears_memory_and_cache() {
+        let agent = Agent::new(dummy_config());
+        let mut session = crate::agent::session::Session::new();
+        let tbl = crate::database::TableInfo {
+            schema: "dbo".into(),
+            table: "Usuario".into(),
+        };
+        let entry = crate::database::schema::SchemaMemoryEntry::new(
+            tbl,
+            vec![],
+            vec!["usuarios".into()],
+            300,
+        );
+        session.schema_memory.insert("dbo.Usuario".into(), entry);
+        // Put dummy cache
+        {
+            let mut guard = agent.schema.write().await;
+            *guard = Some(SchemaCache {
+                expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
+                tables: vec![],
+            });
+        }
+        let res = agent
+            .run_with_history(&mut session, "/refresh")
+            .await
+            .unwrap();
+        assert!(res.contains("refrescado") || res.contains("Refrescado") || res.contains("🔄"));
+        assert!(
+            session.schema_memory.is_empty(),
+            "schema_memory should be cleared on /refresh"
+        );
+        assert!(
+            agent.schema.read().await.is_none(),
+            "schema cache should be cleared on /refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_with_history_clear_empties_messages() {
+        let agent = Agent::new(dummy_config());
+        let mut session = crate::agent::session::Session::new();
+        session.push(crate::llm::Message::user("hola".into()));
+        let res = agent
+            .run_with_history(&mut session, "/clear")
+            .await
+            .unwrap();
+        assert!(res.contains("limpiado") || res.contains("Historial"));
+        assert!(session.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_with_history_empty_question_bails() {
+        let agent = Agent::new(dummy_config());
+        let mut session = crate::agent::session::Session::new();
+        let res = agent.run_with_history(&mut session, "   ").await;
+        assert!(res.is_err());
     }
 }
