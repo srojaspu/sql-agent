@@ -93,29 +93,6 @@ struct Response {
     done: bool,
 }
 
-pub fn sql_tools() -> Vec<ToolDefinition> {
-    vec![
-    ToolDefinition { r#type:"function", function:FunctionDefinition { name:"search_schema", description:"Busca tablas visibles relacionadas con la pregunta. Úsala antes de adivinar nombres.", parameters:json_schema(object(&[("query","string",true)])) } },
-    ToolDefinition { r#type:"function", function:FunctionDefinition { name:"describe_table", description:"Obtiene columnas y tipos de una tabla permitida.", parameters:json_schema(object(&[("table","string",true)])) } },
-    ToolDefinition { r#type:"function", function:FunctionDefinition { name:"execute_read_query", description:"Ejecuta una consulta SQL estrictamente de lectura después de validación de seguridad.", parameters:json_schema(object(&[("sql","string",true)])) } },
-]
-}
-
-fn object(fields: &[(&str, &str, bool)]) -> Value {
-    let mut props = serde_json::Map::new();
-    let mut req = Vec::new();
-    for (n, t, r) in fields {
-        props.insert((*n).into(), serde_json::json!({"type":t}));
-        if *r {
-            req.push((*n).to_string());
-        }
-    }
-    serde_json::json!({"type":"object","properties":props,"required":req,"additionalProperties":false})
-}
-fn json_schema(v: Value) -> Value {
-    v
-}
-
 impl Ollama {
     pub fn new(
         url: String,
@@ -136,14 +113,18 @@ impl Ollama {
             temperature,
         }
     }
-    pub async fn chat(&self, messages: &[Message], verbose: bool) -> Result<Message> {
-        let tools = sql_tools();
+    pub async fn chat(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        verbose: bool,
+    ) -> Result<Message> {
         let req = Request {
             model: &self.model,
             messages,
             stream: false,
             think: false,
-            tools: &tools,
+            tools,
             options: Options {
                 temperature: self.temperature,
             },
