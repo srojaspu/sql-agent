@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::{
     audit,
     config::Config,
-    database::schema::{upsert_schema_memory, SchemaMemoryEntry},
+    database::schema::upsert_schema_memory,
     database::{ColumnInfo, SqlServer, TableInfo},
     llm::{Message, Ollama, ToolCall},
     security::{SecurityPolicy, SqlValidator},
@@ -870,6 +870,35 @@ impl Agent {
      * TABLE ALLOWLIST
      * ================================================================
      */
+
+    /// List tables for TUI /tables command — cached, no LLM, filtered by allowlist
+    pub async fn tui_list_tables(&self) -> Result<String> {
+        let tables = self.cached_tables().await?;
+        let allowed: Vec<_> = tables
+            .iter()
+            .filter(|t| self.table_allowed(&t.schema, &t.table))
+            .collect();
+        if allowed.is_empty() {
+            Ok("No hay tablas visibles para tu filtro.".to_string())
+        } else {
+            let mut out = format!("Tablas disponibles ({}):\n", allowed.len());
+            for t in allowed.iter().take(self.config.max_schema_results) {
+                out.push_str(&format!("  • {}.{}\n", t.schema, t.table));
+            }
+            Ok(out)
+        }
+    }
+
+    /// Describe table for TUI /describe command — no LLM
+    pub async fn tui_describe(&self, table: &str) -> Result<String> {
+        let args = json!({"table": table});
+        self.describe_table_tool(&args).await
+    }
+
+    /// Refresh schema cache for TUI /refresh — clears both SchemaCache and returns count
+    pub async fn refresh_cache(&self) {
+        *self.schema.write().await = None;
+    }
 
     fn table_allowed(&self, schema: &str, table: &str) -> bool {
         /*

@@ -27,3 +27,5 @@ tokio-util = { version = "0.7", features = ["compat"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
+ratatui = { version = "0.29", features = ["crossterm"] }
+crossterm = "0.28"
