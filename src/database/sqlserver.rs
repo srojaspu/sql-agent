@@ -34,6 +34,48 @@ pub struct SqlServer {
     query_gate: Semaphore,
 }
 
+/// Pure, testable core of `verify_read_only` (fail-closed).
+///
+/// `perms` holds the five database write/admin flags (INSERT/UPDATE/DELETE/
+/// ALTER/CONTROL); the role flags deny privileged logins outright. An empty
+/// or short `perms` slice means the permission query returned nothing usable,
+/// which must deny, never allow.
+fn assess_read_only(
+    perms: &[i32],
+    sysadmin: i32,
+    db_owner: i32,
+    control_server: i32,
+) -> Result<()> {
+    check_write_perms(perms)?;
+    check_privileged_roles(sysadmin, db_owner, control_server)
+}
+
+/// Deny when any database-level write/admin permission is granted.
+/// Fails closed on empty/incomplete results.
+fn check_write_perms(perms: &[i32]) -> Result<()> {
+    if perms.len() < 5 {
+        anyhow::bail!("Permission check returned incomplete/empty result; failing closed");
+    }
+    if perms.iter().any(|v| *v > 0) {
+        anyhow::bail!("El login SQL tiene permisos de escritura/administración en la base de datos; agente abortado por seguridad");
+    }
+    Ok(())
+}
+
+/// Deny logins holding dangerous server/database roles.
+fn check_privileged_roles(sysadmin: i32, db_owner: i32, control_server: i32) -> Result<()> {
+    if sysadmin > 0 {
+        anyhow::bail!("El login SQL es miembro de sysadmin; agente abortado por seguridad");
+    }
+    if db_owner > 0 {
+        anyhow::bail!("El login SQL es miembro de db_owner; agente abortado por seguridad");
+    }
+    if control_server > 0 {
+        anyhow::bail!("El login SQL tiene CONTROL SERVER; agente abortado por seguridad");
+    }
+    Ok(())
+}
+
 impl SqlServer {
     pub fn new(config: Config) -> Self {
         Self {
@@ -121,24 +163,29 @@ impl SqlServer {
                 HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'UPDATE') AS can_update,
                 HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'DELETE') AS can_delete,
                 HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'ALTER') AS can_alter,
-                HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CONTROL') AS can_control",
+                HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CONTROL') AS can_control,
+                IS_SRVROLEMEMBER('sysadmin') AS is_sysadmin,
+                IS_MEMBER('db_owner') AS is_db_owner,
+                HAS_PERMS_BY_NAME(NULL, NULL, 'CONTROL SERVER') AS can_control_server",
                 &[],
             )
             .await?
             .into_first_result()
             .await?;
-        if let Some(row) = rows.first() {
-            let perms = (0..5)
-                .map(|i| row.get::<i32, _>(i).unwrap_or(0))
-                .collect::<Vec<_>>();
-            if perms.iter().any(|v| *v > 0) {
-                anyhow::bail!("El login SQL tiene permisos de escritura/administración en la base de datos; agente abortado por seguridad");
-            }
-        }
-        Ok(())
+        let Some(row) = rows.first() else {
+            anyhow::bail!("Permission check returned no rows; failing closed");
+        };
+        let perms = (0..5)
+            .map(|i| row.get::<i32, _>(i).unwrap_or(0))
+            .collect::<Vec<_>>();
+        let sysadmin = row.get::<i32, _>(5).unwrap_or(0);
+        let db_owner = row.get::<i32, _>(6).unwrap_or(0);
+        let control_server = row.get::<i32, _>(7).unwrap_or(0);
+        assess_read_only(&perms, sysadmin, db_owner, control_server)
     }
     pub async fn list_tables(&self) -> Result<Vec<TableInfo>> {
         let mut c = self.connect().await?;
+        self.verify_read_only(&mut c).await?;
         let stream = c.query(list_tables_query(), &[]).await?;
         let rows = stream.into_first_result().await?;
 
@@ -162,6 +209,7 @@ impl SqlServer {
     /// Search column names across the whole schema (LIKE-escaped, parameterized).
     pub async fn search_columns(&self, term: &str) -> Result<Vec<ColumnMatch>> {
         let mut c = self.connect().await?;
+        self.verify_read_only(&mut c).await?;
         let pattern = format!("%{}%", escape_like_pattern(term.trim()));
         let stream = c.query(search_columns_query(), &[&pattern]).await?;
         let rows = stream.into_first_result().await?;
@@ -197,6 +245,7 @@ impl SqlServer {
         let mut c = self.connect().await?;
 
         // Primary keys
+        self.verify_read_only(&mut c).await?;
         let stream = c
             .query(
                 "SELECT kcu.COLUMN_NAME \
@@ -318,6 +367,7 @@ impl SqlServer {
     pub async fn describe_table(&self, table: &str) -> Result<Vec<ColumnInfo>> {
         let (schema, name) = split_table_name(table);
         let mut c = self.connect().await?;
+        self.verify_read_only(&mut c).await?;
         let stream = c
             .query(
                 "SELECT COLUMN_NAME,DATA_TYPE,IS_NULLABLE,ORDINAL_POSITION \
@@ -576,6 +626,46 @@ fn cell_to_json(row: &tiberius::Row, idx: usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_permission_result_fails_closed() {
+        assert!(
+            assess_read_only(&[], 0, 0, 0).is_err(),
+            "empty permission result must fail closed"
+        );
+        assert!(
+            check_write_perms(&[]).is_err(),
+            "empty perms must fail closed"
+        );
+        assert!(
+            check_write_perms(&[0, 0, 0]).is_err(),
+            "incomplete perms must fail closed"
+        );
+    }
+
+    #[test]
+    fn discovery_without_permissions_fails_closed() {
+        // Read-only login: all write flags off, no privileged roles.
+        assert!(assess_read_only(&[0, 0, 0, 0, 0], 0, 0, 0).is_ok());
+        // Any write/admin grant denies discovery.
+        assert!(assess_read_only(&[0, 1, 0, 0, 0], 0, 0, 0).is_err());
+        assert!(assess_read_only(&[0, 0, 0, 0, 1], 0, 0, 0).is_err());
+    }
+
+    #[test]
+    fn privileged_roles_are_denied() {
+        assert!(check_privileged_roles(0, 0, 0).is_ok());
+        assert!(check_privileged_roles(1, 0, 0).is_err(), "sysadmin must be denied");
+        assert!(check_privileged_roles(0, 1, 0).is_err(), "db_owner must be denied");
+        assert!(
+            check_privileged_roles(0, 0, 1).is_err(),
+            "CONTROL SERVER must be denied"
+        );
+        assert!(
+            assess_read_only(&[0, 0, 0, 0, 0], 1, 0, 0).is_err(),
+            "sysadmin must deny even with no write flags"
+        );
+    }
 
     #[test]
     fn escape_like_leaves_plain_text_untouched() {

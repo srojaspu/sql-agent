@@ -18,7 +18,7 @@ use crate::{
 
 use crate::agent::{
     prompt::SYSTEM_PROMPT,
-    session::{build_history_context, is_anaphoric, Session, MAX_CHARS},
+    session::{build_history_context, is_anaphoric, redact_content, Session, MAX_CHARS},
     tools,
 };
 
@@ -90,7 +90,7 @@ impl Agent {
             "request",
             json!({
                 "request_id": request_id,
-                "question": question
+                "question": redact_content(question)
             }),
         )
         .await?;
@@ -334,7 +334,7 @@ impl Agent {
             json!({
                 "request_id": request_id,
                 "session_id": session.id,
-                "question": question,
+                "question": redact_content(question),
                 "anaphoric": is_anaphoric(question)
             }),
         )
@@ -795,7 +795,7 @@ impl Agent {
             json!({
                 "request_id": request_id,
                 "sql": if self.config.audit_sql {
-                    json!(sql)
+                    json!(redact_content(sql))
                 } else {
                     json!("[REDACTED]")
                 }

@@ -66,7 +66,7 @@ impl Config {
             database_name: get_required(map, "DATABASE_NAME")?,
             database_user: get_required(map, "DATABASE_USER")?,
             database_password: get_required(map, "DATABASE_PASSWORD")?,
-            database_trust_cert: parse_bool_map(map, "DATABASE_TRUST_CERT", true)?,
+            database_trust_cert: parse_bool_map(map, "DATABASE_TRUST_CERT", false)?,
 
             ollama_url: get_default_map(map, "OLLAMA_URL", "http://127.0.0.1:11434"),
             ollama_model: get_default_map(map, "OLLAMA_MODEL", "qwen3:4b"),
@@ -106,7 +106,8 @@ impl Config {
 
             audit_enabled: parse_bool_map(map, "AUDIT_ENABLED", true)?,
             audit_path: get_default_map(map, "AUDIT_PATH", "logs/agent-audit.jsonl"),
-            audit_sql: parse_bool_map(map, "AUDIT_SQL", true)?,
+            // Default false: audit SQL text may contain PII; opt in explicitly.
+            audit_sql: parse_bool_map(map, "AUDIT_SQL", false)?,
             verbose: false,
         })
     }
@@ -329,6 +330,34 @@ mod tests {
         m.insert("DATABASE_USER".into(), "user".into());
         m.insert("DATABASE_PASSWORD".into(), "pass".into());
         m
+    }
+
+    #[test]
+    fn trust_cert_defaults_to_false() {
+        let m = minimal_map();
+        let cfg = Config::from_map(&m).expect("defaults should parse");
+        assert!(
+            !cfg.database_trust_cert,
+            "DATABASE_TRUST_CERT must default to false (explicit dev opt-in only)"
+        );
+    }
+
+    #[test]
+    fn trust_cert_explicit_dev_override() {
+        let mut m = minimal_map();
+        m.insert("DATABASE_TRUST_CERT".into(), "true".into());
+        let cfg = Config::from_map(&m).expect("explicit override should parse");
+        assert!(cfg.database_trust_cert);
+    }
+
+    #[test]
+    fn audit_sql_defaults_to_false_pii_safe() {
+        let m = minimal_map();
+        let cfg = Config::from_map(&m).expect("defaults should parse");
+        assert!(
+            !cfg.audit_sql,
+            "AUDIT_SQL must default to false so query text with PII is not persisted"
+        );
     }
 
     #[test]

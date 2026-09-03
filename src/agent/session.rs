@@ -125,7 +125,7 @@ impl Session {
         Self::history_path()
     }
 
-    async fn rotate_file(path: &Path) -> Result<()> {
+    pub(crate) async fn rotate_file(path: &Path) -> Result<()> {
         let content = tokio::fs::read_to_string(path).await.unwrap_or_default();
         let lines: Vec<&str> = content.lines().collect();
         // Keep last 5000 lines
@@ -259,7 +259,7 @@ impl Default for Session {
     }
 }
 
-fn redact_content(content: &str) -> String {
+pub(crate) fn redact_content(content: &str) -> String {
     let lower = content.to_ascii_lowercase();
     let sensitive = [
         "password",

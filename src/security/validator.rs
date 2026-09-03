@@ -366,9 +366,21 @@ impl SqlValidator {
     fn validate_expr(&self, expr: &Expr, ctx: &mut ValidationContext) -> Result<()> {
         match expr {
             // Leaves: no nested expressions or queries.
-            Expr::Identifier(_)
-            | Expr::CompoundIdentifier(_)
-            | Expr::Value(_)
+            Expr::Identifier(ident) => {
+                if is_at_variable(&ident.value) {
+                    bail!("Variable de sistema bloqueada: {}", ident.value);
+                }
+                Ok(())
+            }
+            Expr::CompoundIdentifier(idents) => {
+                for ident in idents {
+                    if is_at_variable(&ident.value) {
+                        bail!("Variable de sistema bloqueada: {}", ident.value);
+                    }
+                }
+                Ok(())
+            }
+            Expr::Value(_)
             | Expr::TypedString { .. }
             | Expr::IntroducedString { .. }
             | Expr::Wildcard(_)
@@ -636,6 +648,10 @@ impl SqlValidator {
     }
 
     fn validate_function(&self, func: &Function, ctx: &mut ValidationContext) -> Result<()> {
+        let name = func.name.0.last().map(|i| i.value.as_str()).unwrap_or("");
+        if is_blocked_system_func(name) {
+            bail!("Función de sistema bloqueada: {name}");
+        }
         self.validate_function_args(&func.parameters, ctx)?;
         self.validate_function_args(&func.args, ctx)?;
         if let Some(filter) = &func.filter {
@@ -837,6 +853,46 @@ fn normalize_table(s: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Scalar system-information functions that must never appear, even when the
+/// query targets an allowlisted table (P0-2). Identity, host, database, and
+/// clock disclosure has no legitimate reporting use through this agent.
+/// `@@` variables are denied separately via [`is_at_variable`].
+fn is_blocked_system_func(name: &str) -> bool {
+    let upper = name
+        .trim()
+        .trim_matches(|c| c == '[' || c == ']' || c == '"')
+        .to_ascii_uppercase();
+    let short = upper.rsplit('.').next().unwrap_or(&upper);
+    if short.starts_with("@@") {
+        return true;
+    }
+    matches!(
+        short,
+        "SUSER_SNAME"
+            | "SUSER_SID"
+            | "SUSER_NAME"
+            | "SYSTEM_USER"
+            | "SESSION_USER"
+            | "ORIGINAL_LOGIN"
+            | "HOST_NAME"
+            | "HOST_ID"
+            | "APP_NAME"
+            | "DB_NAME"
+            | "DB_ID"
+            | "GETDATE"
+            | "GETUTCDATE"
+            | "SYSDATETIME"
+            | "SYSUTCDATETIME"
+            | "SYSDATETIMEOFFSET"
+    )
+}
+
+/// T-SQL system variables (`@@VERSION`, `@@SERVERNAME`, ...) parse as
+/// identifiers rather than function calls, so they need their own check.
+fn is_at_variable(name: &str) -> bool {
+    name.trim_start().starts_with("@@")
+}
+
 fn contains_word(sql: &str, word: &str) -> bool {
     sql.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .any(|p| p.eq_ignore_ascii_case(word))
@@ -928,5 +984,23 @@ mod tests {
     #[test]
     fn system_blocked() {
         assert!(v().validate("SELECT * FROM sys.objects").is_err());
+    }
+    #[test]
+    fn system_func_via_from_blocked() {
+        assert!(v()
+            .validate("SELECT SUSER_SNAME() FROM dbo.entradaLote")
+            .is_err());
+        assert!(v().validate("SELECT HOST_NAME() FROM dbo.entradaLote").is_err());
+        assert!(v().validate("SELECT DB_NAME() FROM dbo.entradaLote").is_err());
+        assert!(v().validate("SELECT GETDATE() FROM dbo.entradaLote").is_err());
+        assert!(v()
+            .validate("SELECT @@VERSION FROM dbo.entradaLote")
+            .is_err());
+    }
+    #[test]
+    fn normal_select_with_allowed_func_passes() {
+        assert!(v()
+            .validate("SELECT COUNT(*) FROM dbo.entradaLote")
+            .is_ok());
     }
 }
