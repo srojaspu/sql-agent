@@ -6,6 +6,34 @@ use std::collections::HashMap;
 pub struct TableInfo {
     pub schema: String,
     pub table: String,
+    /// TABLE_TYPE from INFORMATION_SCHEMA.TABLES: "BASE TABLE" or "VIEW".
+    pub table_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnMatch {
+    pub schema: String,
+    pub table: String,
+    pub column: String,
+    pub data_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForeignKeyInfo {
+    pub column: String,
+    pub ref_schema: String,
+    pub ref_table: String,
+    pub ref_column: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableDetail {
+    pub columns: Vec<ColumnInfo>,
+    pub primary_keys: Vec<String>,
+    pub foreign_keys: Vec<ForeignKeyInfo>,
+    pub view_definition: Option<String>,
+    pub sample_rows: Vec<serde_json::Value>,
+    pub row_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,7 +141,28 @@ mod tests {
         TableInfo {
             schema: "dbo".into(),
             table: "Usuario".into(),
+            table_type: "BASE TABLE".into(),
         }
+    }
+
+    #[test]
+    fn table_info_carries_table_type() {
+        let t = make_table();
+        assert_eq!(t.table_type, "BASE TABLE");
+    }
+
+    #[test]
+    fn table_info_view_type_survives_serde_roundtrip() {
+        let t = TableInfo {
+            schema: "dbo".into(),
+            table: "VwActive".into(),
+            table_type: "VIEW".into(),
+        };
+        let v = serde_json::to_value(&t).unwrap();
+        assert_eq!(v["table_type"], "VIEW");
+        let back: TableInfo = serde_json::from_value(v).unwrap();
+        assert_eq!(back.table_type, "VIEW");
+        assert_eq!(back.table, "VwActive");
     }
 
     #[test]

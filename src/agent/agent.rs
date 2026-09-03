@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::{
     audit,
     config::Config,
-    database::schema::upsert_schema_memory,
-    database::{ColumnInfo, SqlServer, TableInfo},
+    database::schema::{upsert_schema_memory, ColumnMatch, TableDetail},
+    database::{SqlServer, TableInfo},
     llm::{Message, Ollama, ToolCall},
     security::{SecurityPolicy, SqlValidator},
 };
@@ -485,6 +485,8 @@ impl Agent {
                     let tbl = TableInfo {
                         schema: schema.clone(),
                         table: name.clone(),
+                        // Real type travels on discovery lists; unknown on this path.
+                        table_type: String::new(),
                     };
                     upsert_schema_memory(
                         &mut session.schema_memory,
@@ -496,6 +498,38 @@ impl Agent {
                     );
                 }
                 Ok(result)
+            }
+            "list_tables" => self.list_tables_tool().await,
+            "search_columns" => {
+                let query = args
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let matches = self.search_columns_data(&query).await?;
+                // Ground memory on the matched tables (bounded, best effort).
+                for m in matches.iter().take(5) {
+                    let key = format!("{}.{}", m.schema, m.table);
+                    if let Ok(cols) = self.db.describe_table(&key).await {
+                        upsert_schema_memory(
+                            &mut session.schema_memory,
+                            key,
+                            TableInfo {
+                                schema: m.schema.clone(),
+                                table: m.table.clone(),
+                                table_type: String::new(),
+                            },
+                            cols,
+                            Some(query.clone()),
+                            self.config.schema_cache_seconds,
+                        );
+                    }
+                }
+                Ok(limit_text(
+                    &format_column_matches(&matches, &query),
+                    self.config.max_tool_result_chars,
+                ))
             }
             "execute_read_query" => self.execute_read_tool(&args, request_id).await,
             other => anyhow::bail!("Tool no permitida: {other}"),
@@ -521,6 +555,10 @@ impl Agent {
             "search_schema" => self.search_schema(&args).await,
 
             "describe_table" => self.describe_table_tool(&args).await,
+
+            "list_tables" => self.list_tables_tool().await,
+
+            "search_columns" => self.search_columns_tool(&args).await,
 
             "execute_read_query" => self.execute_read_tool(&args, request_id).await,
 
@@ -655,33 +693,62 @@ impl Agent {
 
         println!("📐 Describiendo {}.{}", schema, name);
 
-        let cols: Vec<ColumnInfo> = self
+        let detail: TableDetail = self
             .db
-            .describe_table(&format!("{}.{}", schema, name))
+            .describe_table_full(&format!("{}.{}", schema, name))
             .await?;
 
-        let mut output = format!("\n✓ ESTRUCTURA DE {}.{}\n\nCOLUMNAS:\n", schema, name);
+        Ok(limit_text(
+            &format_table_detail(&schema, &name, &detail),
+            self.config.max_tool_result_chars,
+        ))
+    }
 
-        for col in &cols {
-            output.push_str(&format!(
-                "  • {} ({}){}\n",
-                col.column,
-                col.data_type,
-                if col.nullable {
-                    " [NULLABLE]"
-                } else {
-                    " [NO NULO]"
-                }
-            ));
+    /*
+     * ================================================================
+     * DISCOVERY TOOLS (SG-1)
+     * ================================================================
+     */
+
+    /// List every visible table and view (SG-1). Cached via `cached_tables`.
+    async fn list_tables_tool(&self) -> Result<String> {
+        let tables = self.cached_tables().await?;
+        let allowed: Vec<TableInfo> = tables
+            .iter()
+            .filter(|t| self.table_allowed(&t.schema, &t.table))
+            .cloned()
+            .collect();
+        Ok(limit_text(
+            &format_table_list(&allowed),
+            self.config.max_tool_result_chars,
+        ))
+    }
+
+    /// Structured column search filtered by the allowlist (SG-1).
+    async fn search_columns_data(&self, query: &str) -> Result<Vec<ColumnMatch>> {
+        if query.trim().is_empty() {
+            anyhow::bail!("Falta query");
         }
+        let matches = self.db.search_columns(query).await?;
+        Ok(matches
+            .into_iter()
+            .filter(|m| self.table_allowed(&m.schema, &m.table))
+            .collect())
+    }
 
-        output.push_str(
-            "\n→ IMPORTANTE: Esta es solo la ESTRUCTURA. \n\
-             Para obtener los DATOS REALES (filas, valores), \
-             usa execute_read_query con un SELECT.",
-        );
-
-        Ok(limit_text(&output, self.config.max_tool_result_chars))
+    /// Formatted column search for the LLM (SG-1).
+    async fn search_columns_tool(&self, args: &Value) -> Result<String> {
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let matches = self.search_columns_data(&query).await?;
+        Ok(limit_text(
+            &format_column_matches(&matches, &query),
+            self.config.max_tool_result_chars,
+        ))
     }
 
     /*
@@ -1085,6 +1152,131 @@ pub fn normalize_term(s: &str) -> String {
     singularize(&stripped)
 }
 
+/// Format the full table/view listing for the LLM (SG-1 discovery).
+/// Pure helper: every entry shows schema, name and type (BASE TABLE / VIEW).
+pub fn format_table_list(tables: &[TableInfo]) -> String {
+    let mut out = format!("✓ TABLAS Y VISTAS: {}\n", tables.len());
+    if tables.is_empty() {
+        out.push_str(
+            "No hay tablas visibles para tu filtro.\n\
+             ⚠️ No inventes nombres de tabla; pide aclaración o ajusta el filtro.\n",
+        );
+    } else {
+        for t in tables {
+            out.push_str(&format!("  • {}.{} [{}]\n", t.schema, t.table, t.table_type));
+        }
+        out.push_str(
+            "\n→ SIGUIENTE PASO: usa describe_table con el nombre calificado \
+             EXACTO de la lista, o search_columns para buscar por columna.\n",
+        );
+    }
+    out
+}
+
+/// Format column search results for the LLM (SG-1 discovery).
+/// Pure helper: every match shows its qualified table.column pair.
+pub fn format_column_matches(matches: &[ColumnMatch], query: &str) -> String {
+    let mut out = format!("✓ COLUMNAS para '{query}': {}\n", matches.len());
+    if matches.is_empty() {
+        out.push_str(&format!(
+            "No se encontraron columnas para '{query}'.\n\
+             → Usa list_tables para explorar el esquema completo; \
+             no inventes nombres de columna.\n"
+        ));
+    } else {
+        for m in matches {
+            out.push_str(&format!(
+                "  • {}.{}.{} ({})\n",
+                m.schema, m.table, m.column, m.data_type
+            ));
+        }
+        out.push_str(
+            "\n→ SIGUIENTE PASO: usa describe_table con la tabla EXACTA \
+             de la lista y luego execute_read_query.\n",
+        );
+    }
+    out
+}
+
+/// Format the enriched describe output for the LLM (SG-2).
+/// Pure helper: ESTRUCTURA + PK + FK + [VIEW definition] + MUESTRA + COUNT(*).
+pub fn format_table_detail(schema: &str, name: &str, detail: &TableDetail) -> String {
+    let mut out = format!("\n✓ ESTRUCTURA DE {schema}.{name}\n\nCOLUMNAS:\n");
+    for col in &detail.columns {
+        out.push_str(&format!(
+            "  • {} ({}){}\n",
+            col.column,
+            col.data_type,
+            if col.nullable {
+                " [NULLABLE]"
+            } else {
+                " [NO NULO]"
+            }
+        ));
+    }
+
+    if detail.primary_keys.is_empty() {
+        out.push_str("\nPRIMARY KEY: (ninguna)\n");
+    } else {
+        out.push_str(&format!(
+            "\nPRIMARY KEY: {}\n",
+            detail.primary_keys.join(", ")
+        ));
+    }
+
+    if detail.foreign_keys.is_empty() {
+        out.push_str("FOREIGN KEYS: (ninguna)\n");
+    } else {
+        out.push_str("FOREIGN KEYS:\n");
+        for fk in &detail.foreign_keys {
+            out.push_str(&format!(
+                "  • {} → {}.{}({})\n",
+                fk.column, fk.ref_schema, fk.ref_table, fk.ref_column
+            ));
+        }
+    }
+
+    if let Some(def) = &detail.view_definition {
+        out.push_str(&format!("\n[VIEW] Definición:\n{def}\n"));
+    }
+
+    out.push_str(&format!(
+        "\nMUESTRA (TOP 5, {} filas):\n",
+        detail.sample_rows.len()
+    ));
+    if detail.sample_rows.is_empty() {
+        out.push_str("  (sin filas)\n");
+    } else {
+        for (idx, row) in detail.sample_rows.iter().enumerate() {
+            if let Some(obj) = row.as_object() {
+                let cells: Vec<String> = obj
+                    .iter()
+                    .map(|(k, v)| {
+                        let display = match v {
+                            Value::Null => "[NULL]".to_string(),
+                            Value::Number(n) => n.to_string(),
+                            Value::String(s) => s.clone(),
+                            Value::Bool(b) => b.to_string(),
+                            _ => "[complex]".to_string(),
+                        };
+                        format!("{k} = {display}")
+                    })
+                    .collect();
+                out.push_str(&format!("  Fila {}: {}\n", idx + 1, cells.join(", ")));
+            } else {
+                out.push_str(&format!("  Fila {}: {row}\n", idx + 1));
+            }
+        }
+    }
+
+    out.push_str(&format!("\nCOUNT(*): {}\n", detail.row_count));
+    out.push_str(
+        "\n→ IMPORTANTE: Esto incluye ESTRUCTURA y MUESTRA. \
+         Para más DATOS usa execute_read_query con un SELECT.",
+    );
+    out
+}
+
 pub fn format_invalid_reinject(candidates: &[TableInfo], error_msg: &str) -> String {
     let mut out = format!("❌ Invalid object name: {}\n", error_msg);
     out.push_str("→ La tabla no existe. Usa solo nombres calificados de search_schema.\n");
@@ -1222,6 +1414,7 @@ mod tests {
             .map(|(s, t)| TableInfo {
                 schema: s.to_string(),
                 table: t.to_string(),
+                table_type: "BASE TABLE".to_string(),
             })
             .collect()
     }
@@ -1315,6 +1508,7 @@ mod tests {
             .map(|i| TableInfo {
                 schema: "dbo".into(),
                 table: format!("Tabla{i:02}"),
+                table_type: "BASE TABLE".into(),
             })
             .collect();
         let ranked = filter_and_rank_tables("", &tables, 20);
@@ -1354,6 +1548,7 @@ mod tests {
             .map(|i| TableInfo {
                 schema: "dbo".into(),
                 table: format!("Tabla{i:02}"),
+                table_type: "BASE TABLE".into(),
             })
             .collect();
         let msg = format_invalid_reinject(&tables, "Invalid object name 'dbo.foo'");
@@ -1361,6 +1556,128 @@ mod tests {
         assert!(msg.contains("Tabla00"));
         assert!(msg.contains("Tabla16"));
         assert!(!msg.contains("Tabla17"), "should limit to 17 candidates");
+    }
+
+    // ===== Task 2.4 discovery formatters (SG-1/SG-2) =====
+    use crate::database::schema::{ColumnMatch, ForeignKeyInfo, TableDetail};
+
+    fn sample_tables_with_types() -> Vec<TableInfo> {
+        vec![
+            TableInfo {
+                schema: "dbo".into(),
+                table: "Orders".into(),
+                table_type: "BASE TABLE".into(),
+            },
+            TableInfo {
+                schema: "dbo".into(),
+                table: "VwActive".into(),
+                table_type: "VIEW".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn format_table_list_shows_schema_and_type() {
+        let out = format_table_list(&sample_tables_with_types());
+        assert!(out.contains("dbo.Orders"), "got: {out}");
+        assert!(out.contains("BASE TABLE"), "got: {out}");
+        assert!(out.contains("dbo.VwActive"), "got: {out}");
+        assert!(out.contains("VIEW"), "got: {out}");
+    }
+
+    #[test]
+    fn format_table_list_empty_warns_without_guessing() {
+        let out = format_table_list(&[]);
+        assert!(out.contains('0'), "got: {out}");
+        assert!(
+            out.to_lowercase().contains("no inventes") || out.to_lowercase().contains("no hay"),
+            "empty list must warn against inventing names, got: {out}"
+        );
+    }
+
+    #[test]
+    fn format_column_matches_returns_table_column_pairs() {
+        let matches = vec![ColumnMatch {
+            schema: "dbo".into(),
+            table: "Orders".into(),
+            column: "email".into(),
+            data_type: "nvarchar".into(),
+        }];
+        let out = format_column_matches(&matches, "email");
+        assert!(out.contains("dbo.Orders"), "got: {out}");
+        assert!(out.contains("email"), "got: {out}");
+    }
+
+    #[test]
+    fn format_column_matches_empty_suggests_discovery() {
+        let out = format_column_matches(&[], "zzz_noexiste");
+        assert!(out.contains("zzz_noexiste"), "got: {out}");
+        assert!(
+            out.contains("list_tables"),
+            "no-match must point back to discovery, got: {out}"
+        );
+    }
+
+    fn sample_detail() -> (String, String, TableDetail) {
+        use serde_json::json;
+        (
+            "dbo".into(),
+            "Orders".into(),
+            TableDetail {
+                columns: vec![crate::database::ColumnInfo {
+                    column: "id".into(),
+                    data_type: "int".into(),
+                    nullable: false,
+                    ordinal: 1,
+                }],
+                primary_keys: vec!["id".into()],
+                foreign_keys: vec![ForeignKeyInfo {
+                    column: "user_id".into(),
+                    ref_schema: "dbo".into(),
+                    ref_table: "Usuario".into(),
+                    ref_column: "id".into(),
+                }],
+                view_definition: None,
+                sample_rows: vec![json!({"id": 1})],
+                row_count: 42,
+            },
+        )
+    }
+
+    #[test]
+    fn format_table_detail_full_table_sections() {
+        let (s, t, d) = sample_detail();
+        let out = format_table_detail(&s, &t, &d);
+        assert!(out.contains("ESTRUCTURA"), "got: {out}");
+        assert!(out.contains("PRIMARY KEY") || out.contains("id"), "got: {out}");
+        assert!(out.contains("dbo.Usuario"), "FK target must appear, got: {out}");
+        assert!(out.contains("42"), "COUNT(*) must appear, got: {out}");
+        assert!(out.contains("MUESTRA"), "got: {out}");
+    }
+
+    #[test]
+    fn format_table_detail_view_and_empty() {
+        let d = TableDetail {
+            columns: vec![],
+            primary_keys: vec![],
+            foreign_keys: vec![],
+            view_definition: Some("SELECT id FROM dbo.Orders".into()),
+            sample_rows: vec![],
+            row_count: 0,
+        };
+        let out = format_table_detail("dbo", "VwEmpty", &d);
+        assert!(out.contains("VIEW"), "view marker must appear, got: {out}");
+        assert!(
+            out.contains("SELECT id FROM dbo.Orders"),
+            "view definition must appear, got: {out}"
+        );
+        assert!(out.contains('0'), "zero count must appear, got: {out}");
+    }
+
+    #[tokio::test]
+    async fn search_columns_data_rejects_empty_query_without_db() {
+        let agent = Agent::new(dummy_config());
+        assert!(agent.search_columns_data("   ").await.is_err());
     }
 
     // ===== Task 2.4 run_with_history helpers =====
@@ -1493,6 +1810,7 @@ mod tests {
         let tbl = crate::database::TableInfo {
             schema: "dbo".into(),
             table: "Usuario".into(),
+            table_type: "BASE TABLE".into(),
         };
         let entry = crate::database::schema::SchemaMemoryEntry::new(
             tbl,
@@ -1516,6 +1834,7 @@ mod tests {
         let tbl = crate::database::TableInfo {
             schema: "dbo".into(),
             table: "Usuario".into(),
+            table_type: "BASE TABLE".into(),
         };
         let mut entry = crate::database::schema::SchemaMemoryEntry::new(
             tbl,
@@ -1541,6 +1860,7 @@ mod tests {
         let tbl = crate::database::TableInfo {
             schema: "dbo".into(),
             table: "Usuario".into(),
+            table_type: "BASE TABLE".into(),
         };
         let entry = crate::database::schema::SchemaMemoryEntry::new(
             tbl,

@@ -14,7 +14,10 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use crate::{
     config::Config,
-    database::{ColumnInfo, TableInfo},
+    database::{
+        schema::{ColumnMatch, ForeignKeyInfo, TableDetail},
+        ColumnInfo, TableInfo,
+    },
 };
 
 type TdsClient = Client<Compat<TcpStream>>;
@@ -136,22 +139,166 @@ impl SqlServer {
     }
     pub async fn list_tables(&self) -> Result<Vec<TableInfo>> {
         let mut c = self.connect().await?;
-        let stream = c.query(
-            "SELECT TABLE_SCHEMA,TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' ORDER BY TABLE_SCHEMA,TABLE_NAME",
-            &[],
-        ).await?;
+        let stream = c.query(list_tables_query(), &[]).await?;
         let rows = stream.into_first_result().await?;
 
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            if let (Some(schema), Some(table)) = (row.get::<&str, _>(0), row.get::<&str, _>(1)) {
+            if let (Some(schema), Some(table), Some(table_type)) = (
+                row.get::<&str, _>(0),
+                row.get::<&str, _>(1),
+                row.get::<&str, _>(2),
+            ) {
                 out.push(TableInfo {
                     schema: schema.into(),
                     table: table.into(),
+                    table_type: table_type.into(),
                 });
             }
         }
         Ok(out)
+    }
+
+    /// Search column names across the whole schema (LIKE-escaped, parameterized).
+    pub async fn search_columns(&self, term: &str) -> Result<Vec<ColumnMatch>> {
+        let mut c = self.connect().await?;
+        let pattern = format!("%{}%", escape_like_pattern(term.trim()));
+        let stream = c.query(search_columns_query(), &[&pattern]).await?;
+        let rows = stream.into_first_result().await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let (Some(schema), Some(table), Some(column), Some(data_type)) = (
+                row.get::<&str, _>(0),
+                row.get::<&str, _>(1),
+                row.get::<&str, _>(2),
+                row.get::<&str, _>(3),
+            ) {
+                out.push(ColumnMatch {
+                    schema: schema.into(),
+                    table: table.into(),
+                    column: column.into(),
+                    data_type: data_type.into(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Enriched describe: columns + PK/FK + view definition + TOP 5 + COUNT(*).
+    /// Works for zero-row tables (empty sample, count 0) and views (definition set).
+    pub async fn describe_table_full(&self, table: &str) -> Result<TableDetail> {
+        let (schema, name) = split_table_name(table);
+        let columns = self.describe_table(table).await?;
+
+        let mut c = self.connect().await?;
+
+        // Primary keys
+        let stream = c
+            .query(
+                "SELECT kcu.COLUMN_NAME \
+                 FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc \
+                 JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu \
+                   ON tc.CONSTRAINT_NAME=kcu.CONSTRAINT_NAME \
+                  AND tc.TABLE_SCHEMA=kcu.TABLE_SCHEMA \
+                 WHERE tc.TABLE_SCHEMA=@P1 AND tc.TABLE_NAME=@P2 \
+                   AND tc.CONSTRAINT_TYPE='PRIMARY KEY' \
+                 ORDER BY kcu.ORDINAL_POSITION",
+                &[&schema, &name],
+            )
+            .await?;
+        let pk_rows = stream.into_first_result().await?;
+        let mut primary_keys = Vec::new();
+        for row in &pk_rows {
+            if let Some(col) = row.get::<&str, _>(0) {
+                primary_keys.push(col.to_owned());
+            }
+        }
+
+        // Foreign keys
+        let stream = c
+            .query(
+                "SELECT kcu.COLUMN_NAME,kcu2.TABLE_SCHEMA,kcu2.TABLE_NAME,kcu2.COLUMN_NAME \
+                 FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc \
+                 JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu \
+                   ON rc.CONSTRAINT_NAME=kcu.CONSTRAINT_NAME \
+                 JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu2 \
+                   ON rc.UNIQUE_CONSTRAINT_NAME=kcu2.CONSTRAINT_NAME \
+                  AND kcu.ORDINAL_POSITION=kcu2.ORDINAL_POSITION \
+                 WHERE kcu.TABLE_SCHEMA=@P1 AND kcu.TABLE_NAME=@P2 \
+                 ORDER BY kcu.ORDINAL_POSITION",
+                &[&schema, &name],
+            )
+            .await?;
+        let fk_rows = stream.into_first_result().await?;
+        let mut foreign_keys = Vec::new();
+        for row in &fk_rows {
+            if let (Some(col), Some(rs), Some(rt), Some(rc)) = (
+                row.get::<&str, _>(0),
+                row.get::<&str, _>(1),
+                row.get::<&str, _>(2),
+                row.get::<&str, _>(3),
+            ) {
+                foreign_keys.push(ForeignKeyInfo {
+                    column: col.into(),
+                    ref_schema: rs.into(),
+                    ref_table: rt.into(),
+                    ref_column: rc.into(),
+                });
+            }
+        }
+
+        // View definition (None for base tables)
+        let stream = c
+            .query(
+                "SELECT VIEW_DEFINITION FROM INFORMATION_SCHEMA.VIEWS \
+                 WHERE TABLE_SCHEMA=@P1 AND TABLE_NAME=@P2",
+                &[&schema, &name],
+            )
+            .await?;
+        let view_rows = stream.into_first_result().await?;
+        let view_definition = view_rows
+            .first()
+            .and_then(|r| r.get::<&str, _>(0))
+            .map(str::to_owned);
+
+        // TOP 5 sample + COUNT(*); identifiers escaped by ]-doubling.
+        let qualified = format!("{}.{}", escape_ident(&schema), escape_ident(&name));
+        let sample_sql = format!("SELECT TOP 5 * FROM {qualified}");
+        let mut sample_rows = Vec::new();
+        {
+            let stream = c.query(sample_sql.as_str(), &[]).await?;
+            let mut sample_stream = stream;
+            while let Some(item) = sample_stream.try_next().await? {
+                if let QueryItem::Row(row) = item {
+                    let mut obj = serde_json::Map::new();
+                    for (i, col) in row.columns().iter().enumerate() {
+                        obj.insert(col.name().to_owned(), cell_to_json(&row, i));
+                    }
+                    sample_rows.push(Value::Object(obj));
+                }
+            }
+        }
+
+        let count_sql = format!("SELECT COUNT(*) FROM {qualified}");
+        let count_rows = c
+            .query(count_sql.as_str(), &[])
+            .await?
+            .into_first_result()
+            .await?;
+        let row_count = count_rows
+            .first()
+            .and_then(|r| r.get::<i32, _>(0))
+            .unwrap_or(0) as i64;
+
+        Ok(TableDetail {
+            columns,
+            primary_keys,
+            foreign_keys,
+            view_definition,
+            sample_rows,
+            row_count,
+        })
     }
 
     pub async fn describe_table(&self, table: &str) -> Result<Vec<ColumnInfo>> {
@@ -241,6 +388,41 @@ impl SqlServer {
     }
 }
 
+/// Query listing every visible table AND view with its type.
+fn list_tables_query() -> &'static str {
+    "SELECT TABLE_SCHEMA,TABLE_NAME,TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES \
+     ORDER BY TABLE_SCHEMA,TABLE_NAME"
+}
+
+/// Parameterized column search; the caller passes a pre-escaped LIKE pattern as @P1.
+fn search_columns_query() -> &'static str {
+    "SELECT c.TABLE_SCHEMA,c.TABLE_NAME,c.COLUMN_NAME,c.DATA_TYPE \
+     FROM INFORMATION_SCHEMA.COLUMNS c \
+     WHERE c.COLUMN_NAME LIKE @P1 \
+     ORDER BY c.TABLE_SCHEMA,c.TABLE_NAME,c.ORDINAL_POSITION"
+}
+
+/// Escape T-SQL LIKE wildcards so the term matches literally.
+/// Bracket-escaping needs no ESCAPE clause: % -> [%], _ -> [_], [ -> [[], ] -> []].
+fn escape_like_pattern(term: &str) -> String {
+    let mut out = String::with_capacity(term.len());
+    for ch in term.chars() {
+        match ch {
+            '%' => out.push_str("[%]"),
+            '_' => out.push_str("[_]"),
+            '[' => out.push_str("[[]"),
+            ']' => out.push_str("[]]"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Quote a T-SQL identifier by wrapping in brackets, doubling any closing bracket.
+fn escape_ident(name: &str) -> String {
+    format!("[{}]", name.replace(']', "]]"))
+}
+
 fn split_table_name(table: &str) -> (String, String) {
     let cleaned = table.trim().replace('[', "").replace(']', "");
     let p: Vec<&str> = cleaned.split('.').collect();
@@ -301,4 +483,52 @@ fn cell_to_json(row: &tiberius::Row, idx: usize) -> Value {
         return json!(v.to_string());
     }
     Value::Null
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_like_leaves_plain_text_untouched() {
+        assert_eq!(escape_like_pattern("email"), "email");
+    }
+
+    #[test]
+    fn escape_like_escapes_wildcards() {
+        assert_eq!(escape_like_pattern("100%_off"), "100[%][_]off");
+    }
+
+    #[test]
+    fn escape_like_escapes_brackets() {
+        assert_eq!(escape_like_pattern("a[b]c"), "a[[]b[]]c");
+    }
+
+    #[test]
+    fn escape_ident_brackets_and_doubles_close() {
+        assert_eq!(escape_ident("dbo"), "[dbo]");
+        assert_eq!(escape_ident("we]ird"), "[we]]ird]");
+    }
+
+    #[test]
+    fn search_columns_query_filters_by_like_param() {
+        let q = search_columns_query();
+        assert!(
+            q.contains("COLUMN_NAME LIKE @P1"),
+            "search must use parameterized LIKE, got: {q}"
+        );
+        assert!(
+            q.contains("INFORMATION_SCHEMA.COLUMNS"),
+            "search must read COLUMNS, got: {q}"
+        );
+    }
+
+    #[test]
+    fn list_tables_query_selects_table_type() {
+        let q = list_tables_query();
+        assert!(
+            q.contains("TABLE_TYPE"),
+            "list must select TABLE_TYPE, got: {q}"
+        );
+    }
 }
