@@ -331,11 +331,7 @@ impl SqlValidator {
         Ok(())
     }
 
-    fn validate_join_operator(
-        &self,
-        op: &JoinOperator,
-        ctx: &mut ValidationContext,
-    ) -> Result<()> {
+    fn validate_join_operator(&self, op: &JoinOperator, ctx: &mut ValidationContext) -> Result<()> {
         match op {
             JoinOperator::Inner(c)
             | JoinOperator::LeftOuter(c)
@@ -420,32 +416,23 @@ impl SqlValidator {
             Expr::IsDistinctFrom(a, b)
             | Expr::IsNotDistinctFrom(a, b)
             | Expr::BinaryOp {
-                left: a,
-                right: b,
-                ..
+                left: a, right: b, ..
             }
             | Expr::AnyOp {
-                left: a,
-                right: b,
-                ..
+                left: a, right: b, ..
             }
             | Expr::AllOp {
-                left: a,
-                right: b,
-                ..
+                left: a, right: b, ..
             } => {
                 self.validate_expr(a, ctx)?;
                 self.validate_expr(b, ctx)
             }
             // Subqueries re-enter query validation under budget.
-            Expr::Subquery(query) | Expr::Exists { subquery: query, .. } => {
-                self.validate_nested_query(query, ctx)
-            }
-            Expr::InSubquery {
-                expr,
-                subquery,
-                ..
-            } => {
+            Expr::Subquery(query)
+            | Expr::Exists {
+                subquery: query, ..
+            } => self.validate_nested_query(query, ctx),
+            Expr::InSubquery { expr, subquery, .. } => {
                 self.validate_expr(expr, ctx)?;
                 self.validate_nested_query(subquery, ctx)
             }
@@ -457,35 +444,22 @@ impl SqlValidator {
                 Ok(())
             }
             Expr::InUnnest {
-                expr,
-                array_expr,
-                ..
+                expr, array_expr, ..
             } => {
                 self.validate_expr(expr, ctx)?;
                 self.validate_expr(array_expr, ctx)
             }
             Expr::Between {
-                expr,
-                low,
-                high,
-                ..
+                expr, low, high, ..
             } => {
                 self.validate_expr(expr, ctx)?;
                 self.validate_expr(low, ctx)?;
                 self.validate_expr(high, ctx)
             }
-            Expr::Like {
-                expr, pattern, ..
-            }
-            | Expr::ILike {
-                expr, pattern, ..
-            }
-            | Expr::SimilarTo {
-                expr, pattern, ..
-            }
-            | Expr::RLike {
-                expr, pattern, ..
-            } => {
+            Expr::Like { expr, pattern, .. }
+            | Expr::ILike { expr, pattern, .. }
+            | Expr::SimilarTo { expr, pattern, .. }
+            | Expr::RLike { expr, pattern, .. } => {
                 self.validate_expr(expr, ctx)?;
                 self.validate_expr(pattern, ctx)
             }
@@ -825,9 +799,7 @@ impl Scope {
                         .or_insert_with(|| Some(base));
                 }
             }
-            TableFactor::Derived {
-                alias: Some(a), ..
-            } => {
+            TableFactor::Derived { alias: Some(a), .. } => {
                 self.qualifiers
                     .entry(normalize_table_name(&a.name.value))
                     .or_insert(None);
@@ -849,7 +821,10 @@ impl Scope {
     /// `schema.table`) to its base table, if the qualifier is known.
     /// Returns `None` when the qualifier matches nothing in scope.
     fn resolve(&self, name: &ObjectName) -> Option<Option<String>> {
-        if let Some(r) = self.qualifiers.get(&normalize_table_name(&name.to_string())) {
+        if let Some(r) = self
+            .qualifiers
+            .get(&normalize_table_name(&name.to_string()))
+        {
             return Some(r.clone());
         }
         if let Some(last) = name.0.last() {
@@ -1003,32 +978,30 @@ mod tests {
         assert!(v()
             .validate("SELECT SUSER_SNAME() FROM dbo.entradaLote")
             .is_err());
-        assert!(v().validate("SELECT HOST_NAME() FROM dbo.entradaLote").is_err());
-        assert!(v().validate("SELECT DB_NAME() FROM dbo.entradaLote").is_err());
-        assert!(v().validate("SELECT GETDATE() FROM dbo.entradaLote").is_err());
+        assert!(v()
+            .validate("SELECT HOST_NAME() FROM dbo.entradaLote")
+            .is_err());
+        assert!(v()
+            .validate("SELECT DB_NAME() FROM dbo.entradaLote")
+            .is_err());
+        assert!(v()
+            .validate("SELECT GETDATE() FROM dbo.entradaLote")
+            .is_err());
         assert!(v()
             .validate("SELECT @@VERSION FROM dbo.entradaLote")
             .is_err());
     }
     #[test]
     fn normal_select_with_allowed_func_passes() {
-        assert!(v()
-            .validate("SELECT COUNT(*) FROM dbo.entradaLote")
-            .is_ok());
+        assert!(v().validate("SELECT COUNT(*) FROM dbo.entradaLote").is_ok());
     }
     #[test]
     fn shared_allowlist_same_allow_block_for_scope_and_global() {
         // The prebuilt allowlist must give identical verdicts through the
         // per-scope wildcard gate and the global table gate.
-        assert!(v()
-            .validate("SELECT * FROM dbo.entradaLote")
-            .is_ok());
-        assert!(v()
-            .validate("SELECT e.* FROM dbo.entradaLote e")
-            .is_ok());
-        assert!(v()
-            .validate("SELECT * FROM dbo.usuarios_secretos")
-            .is_err());
+        assert!(v().validate("SELECT * FROM dbo.entradaLote").is_ok());
+        assert!(v().validate("SELECT e.* FROM dbo.entradaLote e").is_ok());
+        assert!(v().validate("SELECT * FROM dbo.usuarios_secretos").is_err());
         assert!(v()
             .validate("SELECT u.* FROM dbo.usuarios_secretos u")
             .is_err());

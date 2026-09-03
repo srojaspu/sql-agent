@@ -140,7 +140,7 @@ impl AppState {
         self.current_tool = None;
         self.is_loading = false;
         self.scroll_offset = 0; // follow bottom on done
-        // push_assistant already bumped; status/is_loading changed too.
+                                // push_assistant already bumped; status/is_loading changed too.
         self.bump();
     }
 

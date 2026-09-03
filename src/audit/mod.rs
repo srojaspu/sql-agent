@@ -19,9 +19,9 @@ fn redact_value(value: serde_json::Value) -> serde_json::Value {
         serde_json::Value::Array(items) => {
             serde_json::Value::Array(items.into_iter().map(redact_value).collect())
         }
-        serde_json::Value::Object(map) => serde_json::Value::Object(
-            map.into_iter().map(|(k, v)| (k, redact_value(v))).collect(),
-        ),
+        serde_json::Value::Object(map) => {
+            serde_json::Value::Object(map.into_iter().map(|(k, v)| (k, redact_value(v))).collect())
+        }
         other => other,
     }
 }

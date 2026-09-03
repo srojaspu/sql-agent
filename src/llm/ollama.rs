@@ -168,10 +168,7 @@ fn clean_message(mut message: Message) -> Message {
 }
 pub fn strip_thinking(text: &str) -> String {
     let mut result = text.to_string();
-    loop {
-        let Some(start) = result.find("<think>") else {
-            break;
-        };
+    while let Some(start) = result.find("<think>") {
         match result.find("</think>") {
             Some(end) => result.replace_range(start..end + 8, ""),
             None => {

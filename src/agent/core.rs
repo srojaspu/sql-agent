@@ -1209,7 +1209,10 @@ pub fn format_table_list(tables: &[TableInfo]) -> String {
         );
     } else {
         for t in tables {
-            out.push_str(&format!("  • {}.{} [{}]\n", t.schema, t.table, t.table_type));
+            out.push_str(&format!(
+                "  • {}.{} [{}]\n",
+                t.schema, t.table, t.table_type
+            ));
         }
         out.push_str(
             "\n→ SIGUIENTE PASO: usa describe_table con el nombre calificado \
@@ -1331,7 +1334,9 @@ pub fn format_table_detail(schema: &str, name: &str, detail: &TableDetail) -> St
     // Row count -1 means unknown (bounded COUNT timed out or failed);
     // structure/sample above are still complete, so report unknown explicitly.
     if detail.row_count < 0 {
-        out.push_str("\nCOUNT(*): unknown (COUNT capped/timed out — structure above is complete)\n");
+        out.push_str(
+            "\nCOUNT(*): unknown (COUNT capped/timed out — structure above is complete)\n",
+        );
     } else {
         out.push_str(&format!("\nCOUNT(*): {}\n", detail.row_count));
     }
@@ -1739,19 +1744,10 @@ mod tests {
         // P2: the extracted helper must render exactly what both inline
         // matches rendered before the fusion.
         assert_eq!(format_cell_value(&Value::Null), "[NULL]");
-        assert_eq!(
-            format_cell_value(&serde_json::json!(42)),
-            "42"
-        );
-        assert_eq!(
-            format_cell_value(&serde_json::json!("hola")),
-            "hola"
-        );
+        assert_eq!(format_cell_value(&serde_json::json!(42)), "42");
+        assert_eq!(format_cell_value(&serde_json::json!("hola")), "hola");
         assert_eq!(format_cell_value(&serde_json::json!(true)), "true");
-        assert_eq!(
-            format_cell_value(&serde_json::json!({"a": 1})),
-            "[complex]"
-        );
+        assert_eq!(format_cell_value(&serde_json::json!({"a": 1})), "[complex]");
         assert_eq!(format_cell_value(&serde_json::json!([1, 2])), "[complex]");
     }
 
@@ -1872,8 +1868,14 @@ mod tests {
         let (s, t, d) = sample_detail();
         let out = format_table_detail(&s, &t, &d);
         assert!(out.contains("ESTRUCTURA"), "got: {out}");
-        assert!(out.contains("PRIMARY KEY") || out.contains("id"), "got: {out}");
-        assert!(out.contains("dbo.Usuario"), "FK target must appear, got: {out}");
+        assert!(
+            out.contains("PRIMARY KEY") || out.contains("id"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("dbo.Usuario"),
+            "FK target must appear, got: {out}"
+        );
         assert!(out.contains("42"), "COUNT(*) must appear, got: {out}");
         assert!(out.contains("MUESTRA"), "got: {out}");
     }
@@ -1922,8 +1924,14 @@ mod tests {
         let (s, t, mut d) = sample_detail();
         d.row_count = -1;
         let out = format_table_detail(&s, &t, &d);
-        assert!(out.contains("ESTRUCTURA"), "structure must survive, got: {out}");
-        assert!(out.contains("MUESTRA"), "sample section must survive, got: {out}");
+        assert!(
+            out.contains("ESTRUCTURA"),
+            "structure must survive, got: {out}"
+        );
+        assert!(
+            out.contains("MUESTRA"),
+            "sample section must survive, got: {out}"
+        );
         assert!(
             out.contains("unknown"),
             "unknown count must be explicit, got: {out}"
@@ -2218,7 +2226,10 @@ mod tests {
         let dupes = column_matches_for_memory_test();
         let grouped = memory_columns_for_column_matches(&dupes, MEMORY_GROUNDING_LIMIT);
         assert_eq!(grouped.len(), 2, "Orders+Usuario deduped, got {grouped:?}");
-        let orders = grouped.iter().find(|(_, t, _)| t.table == "Orders").unwrap();
+        let orders = grouped
+            .iter()
+            .find(|(_, t, _)| t.table == "Orders")
+            .unwrap();
         assert_eq!(orders.2.len(), 2, "both Orders columns reused");
         // Same format input preserved for the LLM formatter.
         let out = format_column_matches(&dupes, "email");
@@ -2298,7 +2309,10 @@ mod tests {
             .iter()
             .map(|c| c.column.as_str())
             .collect();
-        assert!(cols.contains(&"id") && cols.contains(&"total"), "full list kept");
+        assert!(
+            cols.contains(&"id") && cols.contains(&"total"),
+            "full list kept"
+        );
         assert!(cols.contains(&"email"), "matched column merged");
     }
 
@@ -2324,8 +2338,7 @@ mod tests {
             ("dbo", "UsuarioDireccion"),
         ]);
         for query in ["usuarios", "usu prod", "xyz_noexiste", "pedido", ""] {
-            let (legacy_matched, legacy_sugg) =
-                search_with_fallback(query, &tables, 20);
+            let (legacy_matched, legacy_sugg) = search_with_fallback(query, &tables, 20);
             let norm = precompute_normalized(&tables);
             let (pre_matched, pre_sugg) =
                 search_with_fallback_precomputed(query, &tables, &norm, 20);

@@ -222,8 +222,10 @@ impl Config {
         if allowed.is_empty() {
             return Vec::new();
         }
-        let live_set: HashSet<String> =
-            live_full_names.iter().map(|s| normalize_table_name(s)).collect();
+        let live_set: HashSet<String> = live_full_names
+            .iter()
+            .map(|s| normalize_table_name(s))
+            .collect();
         allowed
             .iter()
             .filter(|a| !live_set.contains(&normalize_table_name(a)))

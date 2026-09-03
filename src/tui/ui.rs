@@ -68,7 +68,9 @@ fn render_content_lines(content: &str) -> Vec<Line<'static>> {
             in_code_block = !in_code_block;
             out.push(Line::from(Span::styled(
                 raw.to_string(),
-                Style::default().fg(Color::Yellow).bg(Color::Rgb(30, 30, 30)),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .bg(Color::Rgb(30, 30, 30)),
             )));
             continue;
         }
@@ -79,7 +81,9 @@ fn render_content_lines(content: &str) -> Vec<Line<'static>> {
         if in_code_block {
             out.push(Line::from(Span::styled(
                 raw.to_string(),
-                Style::default().fg(Color::Yellow).bg(Color::Rgb(30, 30, 30)),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .bg(Color::Rgb(30, 30, 30)),
             )));
         } else if trimmed_start.starts_with('|') && raw.trim_end().ends_with('|') {
             out.push(Line::from(Span::styled(

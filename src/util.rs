@@ -50,16 +50,17 @@ mod tests {
         assert_eq!(normalize_table_name("[dbo].[a]"), "dbo.a");
         assert_eq!(
             normalize_table_name("[dbo].[a]"),
-            "[dbo].[a]"
-                .replace(['[', ']'], "")
-                .to_ascii_lowercase()
+            "[dbo].[a]".replace(['[', ']'], "").to_ascii_lowercase()
         );
         assert_eq!(normalize_table_name("\"dbo\".\"a\""), "dbo.a");
     }
 
     #[test]
     fn split_with_schema_keeps_schema() {
-        assert_eq!(split_table_name("dbo.Usuario"), ("dbo".into(), "Usuario".into()));
+        assert_eq!(
+            split_table_name("dbo.Usuario"),
+            ("dbo".into(), "Usuario".into())
+        );
         assert_eq!(
             split_table_name("[dbo].[Usuario]"),
             ("dbo".into(), "Usuario".into())
@@ -72,7 +73,10 @@ mod tests {
 
     #[test]
     fn split_bare_name_defaults_to_dbo() {
-        assert_eq!(split_table_name("usuarios"), ("dbo".into(), "usuarios".into()));
+        assert_eq!(
+            split_table_name("usuarios"),
+            ("dbo".into(), "usuarios".into())
+        );
         assert_eq!(
             split_table_name("  usuarios  "),
             ("dbo".into(), "usuarios".into())

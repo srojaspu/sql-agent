@@ -302,7 +302,9 @@ fn bloquea_star_sin_from() {
 fn bloquea_where_subquery_no_autorizada() {
     // Unauthorized read hidden in a WHERE subquery must be rejected.
     assert!(v()
-        .validate("SELECT * FROM dbo.entradaLote WHERE id IN (SELECT id FROM dbo.usuarios_secretos)")
+        .validate(
+            "SELECT * FROM dbo.entradaLote WHERE id IN (SELECT id FROM dbo.usuarios_secretos)"
+        )
         .is_err());
 }
 
@@ -329,7 +331,9 @@ fn bloquea_union_mixto() {
 fn bloquea_where_exists_no_autorizado() {
     // EXISTS is a different subquery form than IN: same gate applies.
     assert!(v()
-        .validate("SELECT * FROM dbo.entradaLote WHERE EXISTS (SELECT 1 FROM dbo.usuarios_secretos)")
+        .validate(
+            "SELECT * FROM dbo.entradaLote WHERE EXISTS (SELECT 1 FROM dbo.usuarios_secretos)"
+        )
         .is_err());
 }
 
@@ -358,9 +362,7 @@ fn bloquea_wildcard_calificado_desconocido() {
 #[test]
 fn permite_wildcard_calificado_con_alias() {
     // alias.* over an allowlisted table stays valid.
-    assert!(v()
-        .validate("SELECT e.* FROM dbo.entradaLote e")
-        .is_ok());
+    assert!(v().validate("SELECT e.* FROM dbo.entradaLote e").is_ok());
 }
 
 #[test]

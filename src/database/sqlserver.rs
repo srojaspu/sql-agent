@@ -128,7 +128,8 @@ impl SqlServer {
 
         tracing::debug!(
             "🔌 TCP → {}:{}",
-            self.config.database_host, self.config.database_port
+            self.config.database_host,
+            self.config.database_port
         );
 
         let tcp = timeout(
@@ -393,9 +394,7 @@ impl SqlServer {
         let (schema, name) = split_table_name(table);
         let mut c = self.connect().await?;
         self.verify_read_only(&mut c).await?;
-        let stream = c
-            .query(describe_columns_query(), &[&schema, &name])
-            .await?;
+        let stream = c.query(describe_columns_query(), &[&schema, &name]).await?;
         let rows = stream.into_first_result().await?;
         Ok(parse_column_rows(&rows))
     }
@@ -709,8 +708,14 @@ mod tests {
     #[test]
     fn privileged_roles_are_denied() {
         assert!(check_privileged_roles(0, 0, 0).is_ok());
-        assert!(check_privileged_roles(1, 0, 0).is_err(), "sysadmin must be denied");
-        assert!(check_privileged_roles(0, 1, 0).is_err(), "db_owner must be denied");
+        assert!(
+            check_privileged_roles(1, 0, 0).is_err(),
+            "sysadmin must be denied"
+        );
+        assert!(
+            check_privileged_roles(0, 1, 0).is_err(),
+            "db_owner must be denied"
+        );
         assert!(
             check_privileged_roles(0, 0, 1).is_err(),
             "CONTROL SERVER must be denied"
@@ -903,7 +908,12 @@ mod tests {
         // describe_table and describe_table_full share this projection, so the
         // single-connection refactor cannot drift column sections apart.
         let q = describe_columns_query();
-        for col in ["COLUMN_NAME", "DATA_TYPE", "IS_NULLABLE", "ORDINAL_POSITION"] {
+        for col in [
+            "COLUMN_NAME",
+            "DATA_TYPE",
+            "IS_NULLABLE",
+            "ORDINAL_POSITION",
+        ] {
             assert!(q.contains(col), "columns query must select {col}, got: {q}");
         }
     }
