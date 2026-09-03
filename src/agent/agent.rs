@@ -117,7 +117,9 @@ impl Agent {
         let mut tool_calls_history: Vec<String> = Vec::new();
 
         for step in 1..=self.config.max_steps {
-            println!("\n━━━━━━━━ STEP {step}/{} ━━━━━━━━", self.config.max_steps);
+            if self.config.verbose {
+                println!("\n━━━━━━━━ STEP {step}/{} ━━━━━━━━", self.config.max_steps);
+            }
 
             let tool_defs = tools::definitions();
             let reply = self
@@ -143,10 +145,12 @@ impl Agent {
                  */
 
                 if looks_like_sql(text) {
-                    println!(
-                        "⚠️ SQL detectado como texto; \
-                         validando y ejecutando..."
-                    );
+                    if self.config.verbose {
+                        println!(
+                            "⚠️ SQL detectado como texto; \
+                             validando y ejecutando..."
+                        );
+                    }
 
                     let result = self
                         .execute_read_tool(
@@ -191,7 +195,9 @@ impl Agent {
              * --------------------------------------------------------
              */
 
-            println!("🔧 Tool calls: {}", reply.tool_calls.len());
+            if self.config.verbose {
+                println!("🔧 Tool calls: {}", reply.tool_calls.len());
+            }
 
             if reply.tool_calls.len() > self.config.max_tool_calls_per_step {
                 anyhow::bail!("Demasiadas herramientas en un mismo paso");
@@ -214,11 +220,15 @@ impl Agent {
             {
                 let name = call.function.name.as_str();
 
-                println!("   ↳ {name}");
+                if self.config.verbose {
+                    println!("   ↳ {name}");
+                }
 
                 let result = self.dispatch_tool(call, &request_id).await?;
 
-                println!("   ✓ {name} completado");
+                if self.config.verbose {
+                    println!("   ✓ {name} completado");
+                }
 
                 tool_calls_history.push(name.to_string());
 
@@ -593,7 +603,9 @@ impl Agent {
         let (matched, did_you_mean) =
             search_with_fallback(&query_raw, &allowed, self.config.max_schema_results);
 
-        println!("🔎 search_schema → {} coincidencias", matched.len());
+        if self.config.verbose {
+            println!("🔎 search_schema → {} coincidencias", matched.len());
+        }
 
         let mut output = String::new();
 
@@ -691,7 +703,9 @@ impl Agent {
             anyhow::bail!("Tabla no permitida: {table}");
         }
 
-        println!("📐 Describiendo {}.{}", schema, name);
+        if self.config.verbose {
+            println!("📐 Describiendo {}.{}", schema, name);
+        }
 
         let detail: TableDetail = self
             .db
@@ -764,13 +778,17 @@ impl Agent {
             anyhow::bail!("Falta sql");
         }
 
-        println!("🔐 Validando SQL...");
+        if self.config.verbose {
+            println!("🔐 Validando SQL...");
+        }
 
         self.validator
             .validate(sql)
             .context("SQL bloqueado por política de seguridad")?;
 
-        println!("✅ SQL válido");
+        if self.config.verbose {
+            println!("✅ SQL válido");
+        }
 
         self.audit(
             "sql_approved",
@@ -785,7 +803,9 @@ impl Agent {
         )
         .await?;
 
-        println!("🗄️ Ejecutando consulta...");
+        if self.config.verbose {
+            println!("🗄️ Ejecutando consulta...");
+        }
 
         let result = match self.db.execute_read(sql).await {
             Ok(r) => r,
@@ -812,11 +832,13 @@ impl Agent {
             }
         };
 
-        println!(
-            "📊 {} fila(s){}",
-            result.row_count,
-            if result.truncated { " [LIMITADO]" } else { "" }
-        );
+        if self.config.verbose {
+            println!(
+                "📊 {} fila(s){}",
+                result.row_count,
+                if result.truncated { " [LIMITADO]" } else { "" }
+            );
+        }
 
         /*
          * Formatear resultados de forma clara para LLM pequeño
@@ -885,21 +907,27 @@ impl Agent {
 
             if let Some(cache) = &*guard {
                 if cache.expires_at > Instant::now() {
-                    println!("⚡ Esquema desde caché");
+                    if self.config.verbose {
+                        println!("⚡ Esquema desde caché");
+                    }
 
                     return Ok(cache.tables.clone());
                 }
             }
         }
 
-        println!(
-            "🗄️ SQL Server → \
-             INFORMATION_SCHEMA.TABLES..."
-        );
+        if self.config.verbose {
+            println!(
+                "🗄️ SQL Server → \
+                 INFORMATION_SCHEMA.TABLES..."
+            );
+        }
 
         let tables = self.db.list_tables().await?;
 
-        println!("🔎 search_schema: {} tablas encontradas", tables.len());
+        if self.config.verbose {
+            println!("🔎 search_schema: {} tablas encontradas", tables.len());
+        }
 
         // Validate allowlist vs live (drift detection)
         if !self.config.allowed_tables.is_empty() {
@@ -913,10 +941,12 @@ impl Agent {
                     drifted = ?drifted,
                     "Allowlist drift: allowed tables not found in live DB"
                 );
-                println!(
-                    "⚠️ Allowlist drift: no encontradas en BD: {}",
-                    drifted.join(", ")
-                );
+                if self.config.verbose {
+                    println!(
+                        "⚠️ Allowlist drift: no encontradas en BD: {}",
+                        drifted.join(", ")
+                    );
+                }
             }
         }
 
@@ -1047,7 +1077,6 @@ fn split_table(s: &str) -> (String, String) {
     }
 }
 
-#[cfg(test)]
 pub fn split_table_pub(s: &str) -> (String, String) {
     split_table(s)
 }
@@ -1094,12 +1123,19 @@ pub fn strip_accents(s: &str) -> String {
     s.chars()
         .map(|c| match c {
             'á' | 'à' | 'ä' | 'â' => 'a',
+            'Á' | 'À' | 'Ä' | 'Â' => 'A',
             'é' | 'è' | 'ë' | 'ê' => 'e',
+            'É' | 'È' | 'Ë' | 'Ê' => 'E',
             'í' | 'ì' | 'ï' | 'î' => 'i',
+            'Í' | 'Ì' | 'Ï' | 'Î' => 'I',
             'ó' | 'ò' | 'ö' | 'ô' => 'o',
+            'Ó' | 'Ò' | 'Ö' | 'Ô' => 'O',
             'ú' | 'ù' | 'ü' | 'û' => 'u',
+            'Ú' | 'Ù' | 'Ü' | 'Û' => 'U',
             'ñ' => 'n',
+            'Ñ' => 'N',
             'ç' => 'c',
+            'Ç' => 'C',
             _ => c,
         })
         .collect()

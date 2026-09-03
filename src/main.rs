@@ -36,24 +36,28 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(if args.verbose { "info" } else { "warn" }))
         .without_time()
+        .with_writer(std::io::stderr)
         .init();
 
     let mut config = Config::from_env()?;
     config.verbose = args.verbose;
 
-    println!("\n╔════════════════════════════════════════════════════╗");
-    println!("║             SQL AGENT PROFESSIONAL 0.7            ║");
-    println!("╚════════════════════════════════════════════════════╝");
-    println!("⚙️  Modelo: {}", config.ollama_model);
-    println!(
-        "🗄️  SQL Server: {}:{}",
-        config.database_host, config.database_port
-    );
-    println!("📁 Base: {}", config.database_name);
-    println!("🛡️  Solo lectura: ACTIVADO");
-    println!("🔐 SQL Validator: ACTIVADO");
-    println!("⚡ Cache esquema: ACTIVADO");
-    println!("🔢 Máximo de pasos: {}", config.max_steps);
+    // Banner solo en modo no-TUI (one-shot / check-db / fallback). En TUI la propia UI hace el draw.
+    if !(tui::is_interactive(args.no_tui) && args.question.is_none() && !args.check_db) {
+        println!("\n╔════════════════════════════════════════════════════╗");
+        println!("║             SQL AGENT PROFESSIONAL 0.7            ║");
+        println!("╚════════════════════════════════════════════════════╝");
+        println!("⚙️  Modelo: {}", config.ollama_model);
+        println!(
+            "🗄️  SQL Server: {}:{}",
+            config.database_host, config.database_port
+        );
+        println!("📁 Base: {}", config.database_name);
+        println!("🛡️  Solo lectura: ACTIVADO");
+        println!("🔐 SQL Validator: ACTIVADO");
+        println!("⚡ Cache esquema: ACTIVADO");
+        println!("🔢 Máximo de pasos: {}", config.max_steps);
+    }
 
     let agent = Agent::new(config);
 
@@ -97,7 +101,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_tui(agent: Agent) -> Result<()> {
-    use crossterm::event::{self, Event as CEvent, KeyCode};
+    use crossterm::event::{self, Event as CEvent, KeyCode, KeyEventKind};
     use ratatui::{backend::CrosstermBackend, Terminal};
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -133,6 +137,9 @@ async fn run_tui(agent: Agent) -> Result<()> {
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
                 if event::poll(Duration::from_millis(0))? {
                     if let CEvent::Key(key) = event::read()? {
+                        if key.kind == KeyEventKind::Release {
+                            continue;
+                        }
                         if tui::ui::handle_key(key, &mut app) {
                             break;
                         }

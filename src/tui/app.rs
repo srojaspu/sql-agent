@@ -24,6 +24,8 @@ pub struct AppState {
     pub session: Session,
     pub input: String,
     pub messages: Vec<ChatLine>,
+    /// Traza interna de herramientas — no se muestra en el chat, solo en status/debug.
+    pub tool_trace: Vec<ChatLine>,
     pub scroll_offset: usize,
     pub status: String,
     pub current_tool: Option<String>,
@@ -39,6 +41,7 @@ impl AppState {
             session,
             input: String::new(),
             messages: Vec::new(),
+            tool_trace: Vec::new(),
             scroll_offset: 0,
             status: "Listo — escribe tu pregunta o /help".to_string(),
             current_tool: None,
@@ -69,11 +72,16 @@ impl AppState {
     }
 
     pub fn push_tool(&mut self, name: &str, content: impl Into<String>) {
-        self.push_line(format!("tool:{name}"), content);
+        // Compat: mantiene el método pero la traza interna ya no contamina `messages`.
+        // Se conserva para tests/compatibilidad; el flujo normal usa `tool_trace`.
+        let truncated: String = content.into().chars().take(200).collect();
+        self.tool_trace
+            .push(ChatLine::new(format!("tool:{name}"), truncated));
     }
 
     pub fn clear(&mut self) {
         self.messages.clear();
+        self.tool_trace.clear();
         self.scroll_offset = 0;
         self.status = "Historial limpiado".to_string();
         self.current_tool = None;
@@ -155,7 +163,11 @@ impl AppState {
                 self.set_tool(step, tool);
             }
             AppEvent::AgentTool { name, content } => {
-                self.push_tool(&name, content);
+                // No contaminar el chat: la traza va a `tool_trace` y al status.
+                let truncated: String = content.chars().take(200).collect();
+                self.tool_trace
+                    .push(ChatLine::new(format!("tool:{name}"), truncated));
+                self.current_tool = Some(name.clone());
                 self.status = format!("Herramienta {name} completada");
             }
             AppEvent::AgentDone(result) => {
@@ -341,8 +353,13 @@ mod tests {
             name: "search_schema".into(),
             content: "✓ TABLAS ENCONTRADAS: 1".into(),
         });
-        assert!(app.messages.iter().any(|m| m.role == "tool:search_schema"));
+        // Chat must stay clean — no tool lines in `messages`
+        assert!(!app.messages.iter().any(|m| m.role == "tool:search_schema"));
         assert!(app.status.contains("search_schema"));
+        assert_eq!(app.tool_trace.len(), 1);
+        assert_eq!(app.tool_trace[0].role, "tool:search_schema");
+        // content truncated to 200 chars
+        assert!(app.tool_trace[0].content.contains("TABLAS ENCONTRADAS"));
     }
 
     #[test]

@@ -147,6 +147,33 @@
 
 ---
 
+## [0.8.1] - 2026-09-01 - Polish & Tests (PR4 professional-agent-tui-memory)
+
+### Tests
+- `tests/schema_grounding.rs` (32 tests): cobertura exhaustiva `singularize`/`strip_accents`/`levenshtein`/`normalize_term`/`filter_and_rank_tables`/`search_with_fallback`, trunc K=20 determinística, acentos/plurales `usuarios`→`Usuario`, `administradores`→`Administrador`, `Canciones`→`Cancion`, `clientes`→`Cliente`, 0-match `Did you mean`.
+- `tests/anti_hall.rs` (14 tests): harness que prueba 0 nunca ejecuta `dbo.*` hallucinated, `search_schema` 0 bloquea `describe`/`execute`, `Invalid object name` re-inyecta hasta 17 candidatos, invariante grounding bajo `MAX_STEPS`, prompt contiene `NO inventes` + `Did you mean` + `EXCLUSIVAMENTE` + `calificado`.
+- `tests/security_tests.rs` (+15 tests, total 31): regresión allowlist/CTE/join/subquery siguen bloqueados, alias `BLOCKED_*`→`ALLOWED` no amplía, alias `MAX_AGENT_STEPS`→`MAX_STEPS` no bypass validator, anti-hall no bypass (hallucinated `dbo.usuarios` vía CTE/join/derived sigue bloqueado, comentarios bloqueados).
+
+### Polish
+- `strip_accents` maneja mayúsculas acentuadas (`Á→A`, `Ñ→N`, `Ç→C`).
+- `split_table_pub` público fuera de `#[cfg(test)]` para harness externo.
+- `src/agent/mod.rs` re-exporta helpers puros para tests integración.
+- `docs/ARCHITECTURE.md` ampliada: TUI híbrida, memoria, grounding y tests de referencia.
+- `README.md` documenta TUI (`cargo run` → TUI, `--no-tui`, pipe fallback, `/history` etc.) y memoria JSONL + `SchemaMemory`.
+- `cargo clippy` limpio (5 warnings pre-existentes), `cargo fmt --check` pasa.
+
+### Verificación
+- `cargo test` 191 tests passed (107 lib + 6 bin + 1 live + 32 schema_grounding + 14 anti_hall + 31 security), 0 failed.
+- `cargo clippy` 5 warnings pre-existentes, 0 nuevos; `cargo fmt` ok.
+- Manual: `cargo run -- --help` muestra `--no-tui`; `cargo run` bare non-TTY fallback; `cargo run -- --no-tui "q"` one-shot preservado.
+
+**Versión**: 0.8.1  
+**Fecha**: 2026-09-01  
+**Estado**: ✅ 191 tests, clippy/fmt ok  
+**Modelo**: Qwen 1.7B/4B grounding + TUI
+
+---
+
 **Versión**: 0.8.0  
 **Fecha**: 2026-09-01  
 **Estado**: ✅ Compilado y testeado  

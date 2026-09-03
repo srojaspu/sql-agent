@@ -60,7 +60,7 @@ impl SqlServer {
     async fn connect(&self) -> Result<TdsClient> {
         let config = self.tds_config();
 
-        println!(
+        tracing::debug!(
             "🔌 TCP → {}:{}",
             self.config.database_host, self.config.database_port
         );
@@ -73,7 +73,7 @@ impl SqlServer {
         .context("Timeout TCP SQL Server")??;
 
         tcp.set_nodelay(true)?;
-        println!("✅ TCP conectado");
+        tracing::debug!("✅ TCP conectado");
 
         let client = timeout(
             Duration::from_secs(20),
@@ -83,7 +83,7 @@ impl SqlServer {
         .context("Timeout TLS/autenticación SQL Server")?
         .map_err(|e| anyhow::anyhow!("TLS/autenticación SQL Server: {e}"))?;
 
-        println!("✅ Sesión SQL Server establecida");
+        tracing::debug!("✅ Sesión SQL Server establecida");
         Ok(client)
     }
 

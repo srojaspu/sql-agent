@@ -45,6 +45,52 @@ pub fn parse_command(input: &str) -> Command {
 
 const HELP_TEXT: &str = "Comandos: /clear /history /tables /describe <tabla> /refresh /quit /help | Teclas: Enter enviar, Esc salir, ↑↓ scroll, PgUp/PgDn, Ctrl-C salir";
 
+/// Split content into styled Lines preserving indentation and detecting
+/// code fences (```) and markdown pipe tables (| ... |).
+/// - code block lines: Yellow on dark bg, preserved spaces
+/// - table lines (| ... |): Cyan
+/// - normal lines: White
+/// - empty lines: Line::from("") for spacing
+fn render_content_lines(content: &str) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let mut in_code_block = false;
+    for raw in content.split('\n') {
+        let trimmed_start = raw.trim_start();
+        if trimmed_start.starts_with("```") {
+            in_code_block = !in_code_block;
+            out.push(Line::from(Span::styled(
+                raw.to_string(),
+                Style::default().fg(Color::Yellow).bg(Color::Rgb(30, 30, 30)),
+            )));
+            continue;
+        }
+        if raw.is_empty() {
+            out.push(Line::from(String::new()));
+            continue;
+        }
+        if in_code_block {
+            out.push(Line::from(Span::styled(
+                raw.to_string(),
+                Style::default().fg(Color::Yellow).bg(Color::Rgb(30, 30, 30)),
+            )));
+        } else if trimmed_start.starts_with('|') && raw.trim_end().ends_with('|') {
+            out.push(Line::from(Span::styled(
+                raw.to_string(),
+                Style::default().fg(Color::Cyan),
+            )));
+        } else {
+            out.push(Line::from(Span::styled(
+                raw.to_string(),
+                Style::default().fg(Color::White),
+            )));
+        }
+    }
+    if out.is_empty() {
+        out.push(Line::from(String::new()));
+    }
+    out
+}
+
 /// Render TUI frames: chat 70% + input 15% + status 15%
 pub fn draw(frame: &mut Frame, app: &AppState) {
     let area = frame.area();
@@ -84,35 +130,64 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
                 .collect()
         }
     } else {
-        // Normal chat: visible slice respecting scroll_offset
-        // Use all available height estimate (chunks[0].height) for visible
+        // Normal chat: visible slice respecting scroll_offset — only user/assistant/error.
+        // Tool trace lives in `app.tool_trace` and status pane, never interleaved in chat.
         let height = chunks[0].height.saturating_sub(2) as usize; // borders
         let visible = app.visible_messages(height.max(1));
-        if visible.is_empty() && app.messages.is_empty() {
+        let chat_visible: Vec<&crate::tui::app::ChatLine> = visible
+            .iter()
+            .filter(|l| !l.role.starts_with("tool:"))
+            .collect();
+        let has_any_chat = app.messages.iter().any(|m| !m.role.starts_with("tool:"));
+        if chat_visible.is_empty() && !has_any_chat {
             vec![Line::from(Span::styled(
                 "Bienvenido — escribe tu pregunta y presiona Enter. /help para ayuda.",
                 Style::default().fg(Color::DarkGray),
             ))]
         } else {
-            visible
-                .iter()
-                .map(|l| {
-                    let role_color = if l.role.starts_with("tool:") {
-                        Color::Yellow
-                    } else {
-                        match l.role.as_str() {
-                            "user" => Color::Cyan,
-                            "assistant" => Color::Green,
-                            "error" => Color::Red,
-                            _ => Color::White,
+            let mut expanded: Vec<Line> = Vec::new();
+            for l in chat_visible.iter() {
+                let role_color = match l.role.as_str() {
+                    "user" => Color::Cyan,
+                    "assistant" => Color::Green,
+                    "error" => Color::Red,
+                    _ => Color::White,
+                };
+                let content_lines = render_content_lines(&l.content);
+                for (idx, cl) in content_lines.into_iter().enumerate() {
+                    if idx == 0 {
+                        // first line: role prefix + first content line
+                        // cl may be empty (content ""), handle gracefully
+                        if cl.width() == 0 {
+                            expanded.push(Line::from(vec![Span::styled(
+                                format!("{}: ", l.role),
+                                Style::default().fg(role_color),
+                            )]));
+                        } else {
+                            let mut spans = vec![Span::styled(
+                                format!("{}: ", l.role),
+                                Style::default().fg(role_color),
+                            )];
+                            spans.extend(cl.spans);
+                            expanded.push(Line::from(spans));
                         }
-                    };
-                    Line::from(vec![
-                        Span::styled(format!("{}: ", l.role), Style::default().fg(role_color)),
-                        Span::raw(l.content.clone()),
-                    ])
-                })
-                .collect()
+                    } else if cl.width() == 0 {
+                        expanded.push(Line::from(String::new()));
+                    } else {
+                        let mut spans = vec![Span::raw("  ")];
+                        spans.extend(cl.spans);
+                        expanded.push(Line::from(spans));
+                    }
+                }
+            }
+            // fallback if expanded empty (should not happen)
+            if expanded.is_empty() {
+                expanded.push(Line::from(Span::styled(
+                    "Bienvenido — escribe tu pregunta y presiona Enter. /help para ayuda.",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            expanded
         }
     };
 
@@ -122,7 +197,7 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
         .border_style(Style::default().fg(Color::Blue));
     let chat_para = Paragraph::new(chat_lines)
         .block(chat_block)
-        .wrap(Wrap { trim: true })
+        .wrap(Wrap { trim: false })
         .style(Style::default().fg(Color::White));
     frame.render_widget(chat_para, chunks[0]);
 
@@ -179,7 +254,10 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
 
 /// Handle crossterm key events, mutating AppState. Returns true if should quit.
 pub fn handle_key(key: crossterm::event::KeyEvent, app: &mut AppState) -> bool {
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+    if key.kind == KeyEventKind::Release {
+        return false;
+    }
     match (key.code, key.modifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => return true,
         (KeyCode::Esc, _) => return true,

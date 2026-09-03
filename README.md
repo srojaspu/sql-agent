@@ -61,6 +61,47 @@ cargo run -- --check-db
 cargo run -- --verbose "¿Cuántos lote entradas se registraron este mes?"
 ```
 
+## Uso
+
+### One-shot (clap)
+
+```powershell
+cargo run -- "¿Cuántos usuarios hay?"
+cargo run -- --verbose "lista las últimas 5 entradas"
+cargo run -- --no-tui "¿Cuántos pedidos activos?"
+cargo run -- --check-db
+```
+
+- `cargo run -- "pregunta"` siempre ejecuta en modo one-shot (sin TUI), preservado para scripts/CI.
+- `--no-tui` fuerza one-shot aun en terminal interactiva.
+- Si la salida está redirigida (`echo "hola" | cargo run`, pipe o CI sin TTY) hace fallback automático a one-shot sin intentar raw mode.
+
+### TUI híbrido (ratatui + crossterm)
+
+Bare `cargo run` sin argumentos entra a la TUI si detecta TTY interactiva (stdin + stdout son terminal):
+
+```powershell
+cargo run
+```
+
+Layout: chat 70% + input 15% + status/trace 15% (borders, colores, scroll).
+
+Controles:
+
+- `Enter` enviar, `Esc` limpiar input, `Ctrl-C` / `/quit` salir
+- `Up`/`Down`/`PgUp`/`PgDn` scroll del historial
+- Comandos: `/clear` `/history` `/tables` `/describe <tabla>` `/refresh` `/help` `/quit`
+
+Detalles:
+
+- `/tables` lista tablas en caché (filtradas por `ALLOWED_TABLES`), sin LLM.
+- `/describe <tabla>` muestra estructura sin LLM (mismo validador).
+- `/refresh` invalida caché `INFORMATION_SCHEMA` + `SchemaMemory`.
+- `/history` alterna vista de `~/.sql-agent/history.jsonl` (fallback `./logs/chat-history.jsonl`).
+- Estado muestra `step`/`tool`/`status` via canal `tokio::sync::mpsc` (Agent → UI).
+- `TerminalGuard` restaura raw mode / alt-screen con `Drop` + panic hook (Windows PowerShell safe, best-effort).
+- `cargo run -- --no-tui "pregunta"` desactiva TUI; `cargo run` en pipe también hace fallback con mensaje “Modo no interactivo detectado…”.
+
 ## Ollama
 
 Verifica que Ollama esté activo y que el modelo exista:
@@ -110,6 +151,15 @@ SQL Server → ejecutando consulta read-only
 ```
 
 No se imprime el razonamiento privado del modelo.
+
+## Memoria y sesión
+
+- `Session { id, messages: Vec<Message>, schema_memory, created_at, updated_at }` capped 40 msgs / 30k chars (trunca `tool` más antiguos primero, luego resumen).
+- Anáfora: “y de esos cuantos activos” resuelve via `is_anaphoric` + historial inyectado en el prompt.
+- `SchemaMemory HashMap<tabla, {synonyms, last_used, hit_count, ttl}>` con TTL `SCHEMA_CACHE_SECONDS` (300s compartido con `SchemaCache`); `/refresh` invalida ambos, mantiene sinónimos.
+- Persistencia JSONL append-only `~/.sql-agent/history.jsonl` (fallback `./logs/chat-history.jsonl`), rotación 10k líneas o 5 MB (conserva últimas 5000), redacción `[REDACTED sensitive]`, líneas corruptas se omiten.
+- `Agent::run_with_history(&mut Session, &str)` inyecta memoria + caps en la ventana de contexto; soporta `/refresh` `/clear` `/history` tanto en one-shot como en TUI.
+- Grounding: `search_schema` normaliza (lower, strip_accents, singularize `es`/`s`), AND → OR fallback, ranking Levenshtein, top-K 20, `Did you mean` en 0; prompt canónico `NO inventes` + `EXCLUSIVAMENTE` + nombre calificado.
 
 ## Producción
 
