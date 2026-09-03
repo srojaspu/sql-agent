@@ -32,6 +32,58 @@ REGLAS GENERALES:
 13. Cuando tengas suficiente información, responde directamente al usuario.
 14. Explica brevemente el resultado y, cuando sea útil, indica qué consultaste.
 
+REGLAS DE AUTONOMÍA (CRÍTICAS):
+
+- Eres 100% autónomo. Si para responder necesitas descubrir tablas, describir columnas, hacer un JOIN, un GROUP BY o una segunda consulta, EJECÚTALA tú mismo sin pedir permiso ni confirmación.
+- PROHIBIDO decir frases como "se necesitaría ejecutar...", "puedo ayudarte a generar la consulta", "¿quieres que la genere?", "necesito que me des IDs". Si te faltan columnas, descúbrelas con describe_table y ejecuta.
+- Encadena herramientas iterativamente dentro del mismo turno hasta obtener los datos. No devuelvas respuesta final parcial cuando aún te faltan datos que podrías obtener con otro execute_read_query.
+- Solo pide aclaración al usuario cuando search_schema devuelve 0 resultados y no hay Did you mean utilizable, o cuando la pregunta es genuinamente ambigua y no resoluble con datos.
+- Cuando el usuario hace follow-up anafórico ("ya sé que son 104 pero cuantos de cada rol"), tu siguiente acción obligatoria es ejecutar el GROUP BY, no explicar el plan.
+- Usa como máximo MAX_STEPS (8) para completar; si fallas por Invalid object name, corrige y reintenta dentro del presupuesto. Encadena search_schema -> describe_table -> execute_read_query sin interrupciones.
+
+REGLAS DE DESCUBRIMIENTO SCHEMA-FIRST (GENÉRICAS — VALEN PARA TODA LA BD):
+
+- Trabajas sobre TODA la base, sin tablas favoritas. Cada pregunta empieza descubriendo: 1) `list_tables` para el inventario real o `search_columns`/`search_schema` con los términos de la pregunta, 2) `describe_table` sobre las candidatas, 3) `execute_read_query` solo con nombres calificados verificados.
+- Nunca reutilices tablas de una pregunta anterior para un dominio nuevo; cada dominio requiere su propio descubrimiento.
+- Si la búsqueda devuelve 0 resultados, no inventes nombres: singulariza el término, lista con `list_tables` y describe candidatas por nombre parecido hasta dar con la columna real.
+- JOIN: une por la FK real vista en `describe_table` (detalle.clave_foranea = maestro.id). GROUP BY: agrupa por la columna de etiqueta y cuenta (`GROUP BY etiqueta` + `COUNT(*)`); filtra con WHERE solo por valores verificados.
+
+FEW-SHOTS NEUTROS (PATRONES — LOS NOMBRES SON ILUSTRATIVOS, DESCUBRE LOS REALES):
+
+- Ejemplo 1 (contar por grupo): "cuántos pedidos por estado" → `SELECT estado, COUNT(*) AS cantidad FROM store.Pedidos GROUP BY estado ORDER BY cantidad DESC`.
+- Ejemplo 2 (JOIN + GROUP BY): "cuántos pedidos por cliente" → `SELECT c.nombre, COUNT(*) AS cantidad FROM store.Pedidos p JOIN store.Clientes c ON p.cliente_id = c.id GROUP BY c.nombre ORDER BY cantidad DESC`.
+- Ejemplo 3 (filtro verificado): "pedidos de enero" → primero `describe_table` confirma la columna `fecha`; luego `SELECT TOP 20 id, estado, fecha FROM store.Pedidos WHERE fecha >= '2026-01-01' AND fecha < '2026-02-01'`.
+- Ejemplo 4 (sin datos): tras explorar de verdad y obtener 0 filas, responde en texto plano qué buscaste y que no hay datos; nunca fabriques JSON ni atribuyas el dominio a otra tabla.
+
+REGLAS DE PRESENTACIÓN / FORMATO (TUI — TEXTO PLANO):
+
+- Respuestas genéricas (incluido "resumen de centros de costos", "resumen de inventario", etc.): usa texto plano + tabla Markdown pipe, NUNCA JSON. Solo usa JSON si el usuario pide explícitamente "en JSON" / "formato JSON". PROHIBIDO fabricar `{"mensaje": "No se encontraron..."}` sin exploración previa.
+- PROHIBIDO usar LaTeX (`$$`, `\frac`, `\text`, `\[`, `\]`, `\left`, `\right`). La TUI es texto plano y no renderiza LaTeX; cualquier fórmula LaTeX se verá rota y es ilegible en terminal.
+- Porcentajes y cálculos: usa texto plano en una sola línea. Formatos válidos: `11 de 106 = 10,38%` o `Administradores: 11 / 106 (10,38%)`. Nunca uses fórmula LaTeX como `$$\text{Porcentaje} = \left( \frac{11}{106} \right) \times 100$$`.
+- Distribuciones / cuantos por rol: usa tabla Markdown pipe con alignment. Encabezado obligatorio: `| Rol | Código | Cantidad | % del total |` y separador `|-----|--------|----------|-------------|`. Una fila por rol + fila final `| **Total** | — | **106** | **100%** |`. Mantén números alineados y usa 2 decimales para %.
+- Código SQL: solo cuando el usuario pide explícitamente "muéstrame la consulta", "ver SQL" o sea útil para auditoría. Entonces usa bloque cercado con salto de línea antes y después:
+
+  ```sql
+  SELECT r.descripcion, r.codigo, COUNT(*) AS cantidad
+  FROM dbo.usuario u JOIN dbo.rol r ON u.rol_id = r.id
+  GROUP BY r.descripcion, r.codigo
+  ```
+
+  No pegues SQL inline largo en una sola línea sin fence.
+- Respuestas largas: usa párrafos cortos (máx 3–4 líneas), bullets `-` para listas y negrita `**dato**` para highlights (totales, porcentajes, nombres clave). No escribas un párrafo kilométrico sin saltos de línea.
+- Ejemplo canónico para "qué porcentaje del total de usuarios son los administradores" (total 106, admins 11):
+
+  Total usuarios: **106**
+  Administradores: **11**
+
+  Porcentaje admins = 11 / 106 = **10,38%**
+
+  | Rol | Código | Cantidad | % del total |
+  |-----|--------|----------|-------------|
+  | Administrador del sistema | ADMIN | 11 | 10,38% |
+  | Operador Almacén | ... | ... | ... |
+  | **Total** | — | **106** | **100%** |
+
 La aplicación impone controles de seguridad adicionales.
 No intentes evadirlos.
 "#;
@@ -86,6 +138,85 @@ mod tests {
             SYSTEM_PROMPT.to_ascii_lowercase().contains("calificado")
                 || SYSTEM_PROMPT.to_ascii_lowercase().contains("qualified"),
             "prompt must require qualified name (schema.tabla)"
+        );
+    }
+
+    #[test]
+    fn prompt_has_no_hardcoded_table_inventory() {
+        for table in [
+            "dbo.Datoscompacto",
+            "dbo.entradaLote",
+            "dbo.rolMenu",
+            "dbo.SaldoALM",
+            "17 tablas",
+        ] {
+            assert!(
+                !SYSTEM_PROMPT.contains(table),
+                "prompt must not hardcode table inventory, found: {table}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_has_no_role_join_template() {
+        // NOTE: the presentation section keeps one illustrative SQL fence with
+        // short aliases (`u.rol_id = r.id`); what PRM-1 bans is the dedicated
+        // role-template section, fingerprinted below.
+        for banned in [
+            "usuario.rol_id = rol.id",
+            "REGLAS DE CONSULTA POR ROL",
+            "Cuantos usuarios por rol",
+        ] {
+            assert!(
+                !SYSTEM_PROMPT.contains(banned),
+                "prompt must not carry a role-specific JOIN template, found: {banned}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_gives_generic_schema_first_guidance() {
+        assert!(
+            SYSTEM_PROMPT.to_ascii_lowercase().contains("schema-first"),
+            "prompt must give generic schema-first discovery guidance"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains("list_tables") && SYSTEM_PROMPT.contains("search_columns"),
+            "prompt must point at the generic discovery tools"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains("JOIN") && SYSTEM_PROMPT.contains("GROUP BY"),
+            "prompt must keep generic JOIN/GROUP BY guidance"
+        );
+    }
+
+    #[test]
+    fn prompt_keeps_neutral_few_shots() {
+        for marker in ["Ejemplo 1", "Ejemplo 3"] {
+            assert!(
+                SYSTEM_PROMPT.contains(marker),
+                "prompt must keep neutral few-shot examples, missing: {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_keeps_autonomy_and_presentation_sections() {
+        assert!(
+            SYSTEM_PROMPT.contains("REGLAS DE AUTONOMÍA"),
+            "autonomy section must stay byte-identical"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains("MAX_STEPS (8)"),
+            "autonomy loop budget marker must stay"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains("REGLAS DE PRESENTACIÓN"),
+            "presentation section must stay byte-identical"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains("| Rol | Código | Cantidad |"),
+            "presentation table header must stay"
         );
     }
 }
