@@ -1,4 +1,4 @@
-# SQL Agent Professional v0.7
+# SQL Agent Professional v0.8.1
 
 Agente IA para consultar SQL Server en modo estrictamente read-only. Diseñado para Ollama/Qwen3 y para que el LLM **no tenga acceso directo a SQL Server**.
 
@@ -6,11 +6,13 @@ Agente IA para consultar SQL Server en modo estrictamente read-only. Diseñado p
 
 `Pregunta → Ollama → tools tipadas → SQL Validator AST → SQL Server → resultado → Ollama → respuesta`
 
-Herramientas permitidas:
+Herramientas permitidas (dispatcher cerrado, 5 tools):
 
 - `search_schema`
 - `describe_table`
 - `execute_read_query`
+- `list_tables`
+- `search_columns`
 
 No se ejecuta ninguna herramienta cuyo nombre no esté en el dispatcher.
 
@@ -22,17 +24,24 @@ No se ejecuta ninguna herramienta cuyo nombre no esté en el dispatcher.
 - Parser AST de SQL Server (`sqlparser`) antes de ejecutar.
 - Un solo statement.
 - Solo `SELECT` y `WITH ... SELECT`.
-- CTE permitidos sin permitir que escapen la allowlist.
+- Cada rama `UNION`/`EXCEPT`/`INTERSECT` debe ser read-only.
+- `SELECT INTO` bloqueado (es escritura).
+- Wildcards con alcance: `*` y `alias.*` deben resolver a tablas conocidas del `FROM`/`JOIN` y pasar la allowlist.
+- CTE permitidos sin permitir que escapan la allowlist.
 - Subconsultas y JOINs limitados.
 - Referencias de servidor/base de datos (3/4 partes) bloqueadas.
 - Table-valued functions bloqueadas.
 - Tablas del sistema bloqueadas por defecto.
 - Columnas sensibles bloqueadas por nombres comunes.
 - Comentarios SQL bloqueados.
-- Límites de filas y tamaño de tool result.
-- Timeout de conexión y consulta.
+- Límites de filas y tamaño de tool result (`MAX_TOOL_RESULT_CHARS`).
+- Timeouts por config: TCP via `OLLAMA_CONNECT_TIMEOUT_SECONDS`, handshake TLS y consultas via `QUERY_TIMEOUT_SECONDS`.
+- `DATABASE_TRUST_CERT=false` por defecto (solo `true` explícito en dev).
+- `AUDIT_SQL=false` por defecto (el texto SQL puede contener PII).
 - Concurrencia limitada.
 - Resultsets consumidos en streaming hasta `MAX_ROWS + 1`, evitando cargar millones de filas en memoria.
+- `MONEY`/`SMALLMONEY` llegan como `f64` (límite del driver TDS): para aritmética exacta usar `CAST(... AS DECIMAL)` en SQL.
+- `COUNT(*)` de describe acotado (`TOP 100001`): si expira, `row_count` es `-1` (unknown) y la estructura/muestra se devuelve igual.
 - Auditoría JSONL sin almacenar contraseña.
 - `think=false` en Ollama y limpieza defensiva de `<think>`.
 - El prompt no es una frontera de seguridad: el validator es la frontera.
@@ -176,3 +185,10 @@ No se imprime el razonamiento privado del modelo.
 - Corrige el test de límite de JOINs: `max_joins` es inclusivo. Con `max_joins=5`, cinco JOINs son válidos y seis son rechazados.
 - Añade pruebas explícitas del límite (boundary tests).
 - Sin cambios a la política de seguridad de ejecución.
+
+## v0.8.1 + higiene P2 (2026-09-03)
+
+- Dispatcher documentado como 5 tools (`list_tables`, `search_columns` incluidos).
+- Reglas explicitadas: ramas `UNION` read-only, `SELECT INTO` bloqueado, wildcards con alcance, cap `MONEY`, sentinel `COUNT -1`, timeouts por config, `TRUST_CERT=false` y `AUDIT_SQL=false` por defecto.
+- Higiene interna sin cambio de comportamiento: helpers compartidos (`util`), código muerto eliminado.
+- Sin nuevas features.

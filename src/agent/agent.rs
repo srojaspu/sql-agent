@@ -14,6 +14,7 @@ use crate::{
     database::{ColumnInfo, SqlServer, TableInfo},
     llm::{Message, Ollama, ToolCall},
     security::{SecurityPolicy, SqlValidator},
+    util::split_table_name as shared_split_table,
 };
 
 use crate::agent::{
@@ -867,13 +868,7 @@ impl Agent {
 
                 if let Some(obj) = row.as_object() {
                     for (key, val) in obj {
-                        let display_val = match val {
-                            Value::Null => "[NULL]".to_string(),
-                            Value::Number(n) => n.to_string(),
-                            Value::String(s) => s.clone(),
-                            Value::Bool(b) => b.to_string(),
-                            _ => "[complex]".to_string(),
-                        };
+                        let display_val = format_cell_value(val);
 
                         formatted.push_str(&format!("  {} = {}\n", key, display_val));
                     }
@@ -1080,22 +1075,16 @@ fn normalize_tool_arguments(v: &Value) -> Result<Value> {
  */
 
 fn split_table(s: &str) -> (String, String) {
-    let clean = s.replace(['[', ']', '"'], "");
-
-    let parts: Vec<&str> = clean.split('.').collect();
-
-    if parts.len() >= 2 {
-        (
-            parts[parts.len() - 2].to_string(),
-            parts[parts.len() - 1].to_string(),
-        )
-    } else {
+    // Shared core handles trim/strip/split/dbo-default; keep the warn here
+    // so the sqlserver path stays silent as before.
+    let out = shared_split_table(s);
+    if !s.contains('.') {
         tracing::warn!(
             "split_table: no schema supplied for '{}', defaulting to dbo (explicit schema recommended)",
             s
         );
-        ("dbo".into(), clean)
     }
+    out
 }
 
 pub fn split_table_pub(s: &str) -> (String, String) {
@@ -1255,6 +1244,20 @@ pub fn format_column_matches(matches: &[ColumnMatch], query: &str) -> String {
     out
 }
 
+/// Format a single JSON cell for LLM display (shared by the execute_read
+/// row path and the describe sample path so both render identically).
+/// `Null` renders as `[NULL]`; anything without a scalar mapping renders
+/// as `[complex]` instead of leaking debug output.
+pub fn format_cell_value(v: &Value) -> String {
+    match v {
+        Value::Null => "[NULL]".to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => b.to_string(),
+        _ => "[complex]".to_string(),
+    }
+}
+
 /// Format the enriched describe output for the LLM (SG-2).
 /// Pure helper: ESTRUCTURA + PK + FK + [VIEW definition] + MUESTRA + COUNT(*).
 pub fn format_table_detail(schema: &str, name: &str, detail: &TableDetail) -> String {
@@ -1314,13 +1317,7 @@ pub fn format_table_detail(schema: &str, name: &str, detail: &TableDetail) -> St
                 let cells: Vec<String> = obj
                     .iter()
                     .map(|(k, v)| {
-                        let display = match v {
-                            Value::Null => "[NULL]".to_string(),
-                            Value::Number(n) => n.to_string(),
-                            Value::String(s) => s.clone(),
-                            Value::Bool(b) => b.to_string(),
-                            _ => "[complex]".to_string(),
-                        };
+                        let display = format_cell_value(v);
                         format!("{k} = {display}")
                     })
                     .collect();
@@ -1439,7 +1436,6 @@ pub fn ground_memory_from_column_matches(
 /// Pure ranking helper used by `search_schema` and tests.
 /// Returns ranked matches after AND→OR fallback, truncated to `max_results`.
 /// For empty query, returns first `max_results` tables (no ranking).
-#[allow(dead_code)]
 pub fn filter_and_rank_tables(
     query: &str,
     tables: &[TableInfo],
@@ -1480,7 +1476,7 @@ pub fn search_with_fallback_masked(
         let ranked: Vec<TableInfo> = tables
             .iter()
             .enumerate()
-            .filter(|(i, _)| allowed.map_or(true, |m| m[*i]))
+            .filter(|(i, _)| allowed.is_none_or(|m| m[*i]))
             .take(max_results)
             .map(|(_, t)| t.clone())
             .collect();
@@ -1488,7 +1484,7 @@ pub fn search_with_fallback_masked(
     }
     let terms: Vec<String> = q.split_whitespace().map(normalize_term).collect();
     let norm_query_joined = terms.join(" ");
-    let is_allowed = |i: usize| allowed.map_or(true, |m| m[i]);
+    let is_allowed = |i: usize| allowed.is_none_or(|m| m[i]);
 
     // AND phase (indices only; clone after truncate)
     let mut and_matches: Vec<(usize, usize)> = Vec::new();
@@ -1688,7 +1684,7 @@ mod tests {
     fn search_truncates_to_max_k() {
         let mut names = Vec::new();
         for i in 0..30 {
-            names.push((format!("dbo"), format!("Tabla{i:02}")));
+            names.push(("dbo".to_string(), format!("Tabla{i:02}")));
         }
         // Convert to &[(&str,&str)] not easy, so build tables directly
         let tables: Vec<TableInfo> = (0..30)
@@ -1717,6 +1713,46 @@ mod tests {
         let (s2, t2) = split_table_pub("[dbo].[Usuario]");
         assert_eq!(s2, "dbo");
         assert_eq!(t2, "Usuario");
+    }
+
+    #[test]
+    fn split_table_matches_shared_helper() {
+        // P2: agent split_table must stay equivalent to the shared helper
+        // (warn-only difference on missing schema).
+        for input in [
+            "dbo.Usuario",
+            "[dbo].[Usuario]",
+            "\"dbo\".\"Usuario\"",
+            "usuarios",
+            "db.dbo.Usuario",
+        ] {
+            assert_eq!(
+                split_table_pub(input),
+                crate::util::split_table_name(input),
+                "mismatch for {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_cell_value_matches_both_row_paths() {
+        // P2: the extracted helper must render exactly what both inline
+        // matches rendered before the fusion.
+        assert_eq!(format_cell_value(&Value::Null), "[NULL]");
+        assert_eq!(
+            format_cell_value(&serde_json::json!(42)),
+            "42"
+        );
+        assert_eq!(
+            format_cell_value(&serde_json::json!("hola")),
+            "hola"
+        );
+        assert_eq!(format_cell_value(&serde_json::json!(true)), "true");
+        assert_eq!(
+            format_cell_value(&serde_json::json!({"a": 1})),
+            "[complex]"
+        );
+        assert_eq!(format_cell_value(&serde_json::json!([1, 2])), "[complex]");
     }
 
     #[test]
@@ -1917,7 +1953,6 @@ mod tests {
             max_steps: 8,
             max_sql_length: 10_000,
             max_rows: 100,
-            max_result_chars: 30_000,
             schema_cache_seconds: 300,
             query_timeout_seconds: 30,
             max_concurrent_queries: 1,

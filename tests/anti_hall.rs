@@ -165,7 +165,7 @@ fn zero_match_does_not_return_hallucinated_as_ranked() {
     // Ensure hallucinated string not in ranked
     assert!(!ranked
         .iter()
-        .any(|t| t.table.to_ascii_lowercase() == "usuarios_falso_xyz"));
+        .any(|t| t.table.eq_ignore_ascii_case("usuarios_falso_xyz")));
 }
 
 // ===== Invalid object name re-injects candidates =====

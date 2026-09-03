@@ -144,41 +144,9 @@ impl Session {
     }
 
     pub async fn persist(&self) -> Result<()> {
-        let path = Self::history_path();
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        // Check rotation before append
-        if path.exists() {
-            if let Ok(meta) = tokio::fs::metadata(&path).await {
-                if meta.len() > JSONL_MAX_BYTES {
-                    Self::rotate_file(&path).await?;
-                } else {
-                    // check lines
-                    if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                        let lines = content.lines().count();
-                        if lines >= JSONL_MAX_LINES {
-                            Self::rotate_file(&path).await?;
-                        }
-                    }
-                }
-            }
-        }
-        // Clone and redact sensitive content before serialization
-        let mut redacted = self.clone();
-        for msg in &mut redacted.messages {
-            msg.content = redact_content(&msg.content);
-        }
-        // Redact schema_memory synonyms? keep but redact?
-        let json = serde_json::to_string(&redacted)?;
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await?;
-        file.write_all(json.as_bytes()).await?;
-        file.write_all(b"\n").await?;
-        Ok(())
+        // Single persistence path: default location delegates to the
+        // shared persist_to implementation (rotation + redaction + append).
+        self.persist_to(&Self::history_path()).await
     }
 
     pub async fn load_last() -> Result<Option<Self>> {

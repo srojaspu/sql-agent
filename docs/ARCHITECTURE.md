@@ -12,11 +12,11 @@ Usuario ──→ main.rs (clap Args {verbose,check_db,question,no_tui})
 
 Flujo original (one-shot) preservado: `Pregunta → Ollama → tools tipadas → SQL Validator AST → SQL Server → resultado → Ollama → respuesta`.
 
-Herramientas: `search_schema` (hardened: normalize singularize accent-strip OR-fallback Levenshtein top-K 20 + Did-you-mean) → `describe_table` → `execute_read_query`.
+Herramientas: `search_schema` (hardened: normalize singularize accent-strip OR-fallback Levenshtein top-K 20 + Did-you-mean) → `describe_table` → `execute_read_query`, más descubrimiento `list_tables` (todas las tablas/vistas visibles) y `search_columns` (búsqueda por columna en todo el esquema).
 
 ## Principio clave
 
-El modelo puede proponer una acción, pero no puede decidir qué acciones existen ni qué permisos tiene. El dispatcher solo acepta tres nombres de herramientas y `execute_read_query` siempre pasa por el validator (`SqlValidator` es la única frontera; el prompt no lo es).
+El modelo puede proponer una acción, pero no puede decidir qué acciones existen ni qué permisos tiene. El dispatcher solo acepta cinco nombres de herramientas (`search_schema`, `describe_table`, `execute_read_query`, `list_tables`, `search_columns`) y `execute_read_query` siempre pasa por el validator (`SqlValidator` es la única frontera; el prompt no lo es).
 
 Grounding invariante: `search_schema` 0 nunca inventa `dbo.*`; si 0, retorna `0 + top-K + Did you mean` y bloquea `describe/execute` hallucinated; `Invalid object name` re-inyecta hasta 17 candidatos y continúa dentro de `MAX_STEPS`.
 
@@ -39,7 +39,10 @@ Grounding invariante: `search_schema` 0 nunca inventa `dbo.*`; si 0, retorna `0 
 ## Config y seguridad
 
 - `Config::from_map` canónica, aliases `BLOCKED_TABLES`/`BLOCKED_COLUMNS` → `ALLOWED_TABLES` y `MAX_AGENT_STEPS` → `MAX_STEPS` con `tracing::warn`, fail-fast en `validate_no_unknown`, drift `find_drifted` vs `INFORMATION_SCHEMA.TABLES`.
-- `SqlValidator` (SELECT-only, single-stmt, allowlist, join/subquery caps, comment/system block 3/4-part, TVF block) intacto; `max_result_chars` + `max_tool_result_chars` en memoria+audit.
+- `SqlValidator` (SELECT-only, single-stmt, allowlist, join/subquery caps, comment/system block 3/4-part, TVF block) intacto; cada rama `UNION`/`EXCEPT`/`INTERSECT` debe ser read-only, `SELECT INTO` bloqueado, wildcards (`*`, `alias.*`) con alcance a `FROM`/`JOIN` conocido más allowlist.
+- `max_tool_result_chars` limita salida de tools en memoria+audit (`MAX_RESULT_CHARS` eliminado: deprecated e ignorado).
+- Celdas: `MONEY`/`SMALLMONEY` llegan como `f64` por el driver TDS (requiere `CAST(... AS DECIMAL)` para exactitud); `COUNT(*)` de describe acotado con sentinel `-1` = unknown (estructura/muestra intactas).
+- Timeouts por config: TCP via `OLLAMA_CONNECT_TIMEOUT_SECONDS`, handshake TLS y consultas via `QUERY_TIMEOUT_SECONDS`; `DATABASE_TRUST_CERT=false` y `AUDIT_SQL=false` por defecto.
 
 ## Observabilidad
 

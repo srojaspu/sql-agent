@@ -11,6 +11,8 @@ use sqlparser::{
 };
 use std::collections::{HashMap, HashSet};
 
+use crate::util::normalize_table_name;
+
 #[derive(Clone, Debug)]
 pub struct SecurityPolicy {
     pub max_sql_length: usize,
@@ -81,19 +83,21 @@ impl SqlValidator {
             _ => bail!("Solo se permite SELECT/CTE SELECT"),
         };
 
-        let mut ctx = ValidationContext::default();
-        // Build the allowlist once per validation and share it with every
-        // scope check below. `None` means "no allowlist configured".
-        ctx.allowed = if self.policy.allowed_tables.is_empty() {
-            None
-        } else {
-            Some(
-                self.policy
-                    .allowed_tables
-                    .iter()
-                    .map(|s| normalize_table(s))
-                    .collect(),
-            )
+        let mut ctx = ValidationContext {
+            allowed: if self.policy.allowed_tables.is_empty() {
+                None
+            } else {
+                // Build the allowlist once per validation and share it with every
+                // scope check below. `None` means "no allowlist configured".
+                Some(
+                    self.policy
+                        .allowed_tables
+                        .iter()
+                        .map(|s| normalize_table_name(s))
+                        .collect(),
+                )
+            },
+            ..ValidationContext::default()
         };
         self.validate_query(query, &mut ctx)?;
 
@@ -109,7 +113,7 @@ impl SqlValidator {
 
         if !self.policy.allow_system_tables {
             for table in &ctx.tables {
-                let n = normalize_table(table);
+                let n = normalize_table_name(table);
                 if n.starts_with("sys.")
                     || n.contains("information_schema")
                     || n.starts_with("master.")
@@ -121,10 +125,10 @@ impl SqlValidator {
 
         if let Some(allowed) = &ctx.allowed {
             for table in &ctx.tables {
-                if ctx.ctes.contains(&normalize_table(table)) {
+                if ctx.ctes.contains(&normalize_table_name(table)) {
                     continue;
                 }
-                if !allowed.contains(&normalize_table(table)) {
+                if !allowed.contains(&normalize_table_name(table)) {
                     bail!("Tabla no permitida: {table}");
                 }
             }
@@ -157,7 +161,7 @@ impl SqlValidator {
                 bail!("CTE/WITH no permitido");
             }
             for cte in &with.cte_tables {
-                ctx.ctes.insert(normalize_table(&cte.alias.name.value));
+                ctx.ctes.insert(normalize_table_name(&cte.alias.name.value));
                 self.validate_nested_query(&cte.query, ctx)?;
             }
         }
@@ -301,10 +305,10 @@ impl SqlValidator {
             // of rebuilding the HashSet per SELECT scope.
             if let Some(allowed) = &ctx.allowed {
                 for table in &scope.tables {
-                    if ctx.ctes.contains(&normalize_table(table)) {
+                    if ctx.ctes.contains(&normalize_table_name(table)) {
                         continue;
                     }
-                    if !allowed.contains(&normalize_table(table)) {
+                    if !allowed.contains(&normalize_table_name(table)) {
                         bail!("Tabla no permitida: {table}");
                     }
                 }
@@ -803,8 +807,8 @@ impl Scope {
         match factor {
             TableFactor::Table { name, alias, .. } => {
                 let base = name.to_string();
-                let norm = normalize_table(&base);
-                if !self.tables.iter().any(|t| normalize_table(t) == norm) {
+                let norm = normalize_table_name(&base);
+                if !self.tables.iter().any(|t| normalize_table_name(t) == norm) {
                     self.tables.push(base.clone());
                 }
                 self.qualifiers
@@ -812,12 +816,12 @@ impl Scope {
                     .or_insert_with(|| Some(base.clone()));
                 if let Some(short) = name.0.last() {
                     self.qualifiers
-                        .entry(normalize_table(&short.value))
+                        .entry(normalize_table_name(&short.value))
                         .or_insert_with(|| Some(base.clone()));
                 }
                 if let Some(a) = alias {
                     self.qualifiers
-                        .entry(normalize_table(&a.name.value))
+                        .entry(normalize_table_name(&a.name.value))
                         .or_insert_with(|| Some(base));
                 }
             }
@@ -825,7 +829,7 @@ impl Scope {
                 alias: Some(a), ..
             } => {
                 self.qualifiers
-                    .entry(normalize_table(&a.name.value))
+                    .entry(normalize_table_name(&a.name.value))
                     .or_insert(None);
             }
             TableFactor::Derived { .. } => {}
@@ -845,28 +849,21 @@ impl Scope {
     /// `schema.table`) to its base table, if the qualifier is known.
     /// Returns `None` when the qualifier matches nothing in scope.
     fn resolve(&self, name: &ObjectName) -> Option<Option<String>> {
-        if let Some(r) = self.qualifiers.get(&normalize_table(&name.to_string())) {
+        if let Some(r) = self.qualifiers.get(&normalize_table_name(&name.to_string())) {
             return Some(r.clone());
         }
         if let Some(last) = name.0.last() {
-            if let Some(r) = self.qualifiers.get(&normalize_table(&last.value)) {
+            if let Some(r) = self.qualifiers.get(&normalize_table_name(&last.value)) {
                 return Some(r.clone());
             }
         }
         if let Some(first) = name.0.first() {
-            if let Some(r) = self.qualifiers.get(&normalize_table(&first.value)) {
+            if let Some(r) = self.qualifiers.get(&normalize_table_name(&first.value)) {
                 return Some(r.clone());
             }
         }
         None
     }
-}
-
-fn normalize_table(s: &str) -> String {
-    s.replace('[', "")
-        .replace(']', "")
-        .replace('"', "")
-        .to_ascii_lowercase()
 }
 
 /// Scalar system-information functions that must never appear, even when the

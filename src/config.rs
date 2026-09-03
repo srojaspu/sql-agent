@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 
+use crate::util::normalize_table_name;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub database_host: String,
@@ -18,7 +20,6 @@ pub struct Config {
     pub max_steps: usize,
     pub max_sql_length: usize,
     pub max_rows: usize,
-    pub max_result_chars: usize,
     pub schema_cache_seconds: u64,
     pub query_timeout_seconds: u64,
     pub max_concurrent_queries: usize,
@@ -49,13 +50,20 @@ impl Config {
     pub fn from_map(map: &std::collections::HashMap<String, String>) -> Result<Self> {
         Self::validate_no_unknown(map)?;
 
+        // Deprecated, ignored: per-tool output is capped by MAX_TOOL_RESULT_CHARS.
+        if map.contains_key("MAX_RESULT_CHARS") {
+            tracing::warn!(
+                "MAX_RESULT_CHARS is deprecated and ignored, use MAX_TOOL_RESULT_CHARS instead"
+            );
+        }
+
         // Resolve aliases with warnings
         let allowed_tables_raw = Self::resolve_allowed_tables_raw(map);
         let allowed_tables = allowed_tables_raw
             .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(normalize_table)
+            .map(normalize_table_name)
             .collect();
 
         let max_steps_raw = Self::resolve_max_steps_raw(map);
@@ -88,7 +96,6 @@ impl Config {
             },
             max_sql_length: parse_usize_map(map, "MAX_SQL_LENGTH", 10000)?,
             max_rows: parse_usize_map(map, "MAX_ROWS", 100)?,
-            max_result_chars: parse_usize_map(map, "MAX_RESULT_CHARS", 30000)?,
             schema_cache_seconds: parse_u64_map(map, "SCHEMA_CACHE_SECONDS", 300)?,
             query_timeout_seconds: parse_u64_map(map, "QUERY_TIMEOUT_SECONDS", 30)?,
             max_concurrent_queries: parse_usize_map(map, "MAX_CONCURRENT_QUERIES", 1)?,
@@ -216,10 +223,10 @@ impl Config {
             return Vec::new();
         }
         let live_set: HashSet<String> =
-            live_full_names.iter().map(|s| normalize_table(s)).collect();
+            live_full_names.iter().map(|s| normalize_table_name(s)).collect();
         allowed
             .iter()
-            .filter(|a| !live_set.contains(&normalize_table(a)))
+            .filter(|a| !live_set.contains(&normalize_table_name(a)))
             .cloned()
             .collect()
     }
@@ -228,38 +235,6 @@ impl Config {
     pub fn drifted_vs_live(&self, live_full_names: &[String]) -> Vec<String> {
         Self::find_drifted(&self.allowed_tables, live_full_names)
     }
-}
-
-#[allow(dead_code)]
-fn env(key: &str) -> Result<String> {
-    std::env::var(key).with_context(|| format!("Falta variable {key}"))
-}
-#[allow(dead_code)]
-fn env_default(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
-#[allow(dead_code)]
-fn parse_bool(key: &str, default: bool) -> Result<bool> {
-    match std::env::var(key) {
-        Ok(v) => match v.to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" => Ok(true),
-            "false" | "0" | "no" => Ok(false),
-            _ => anyhow::bail!("{key} debe ser true/false"),
-        },
-        Err(_) => Ok(default),
-    }
-}
-#[allow(dead_code)]
-fn parse_u64(key: &str, default: u64) -> Result<u64> {
-    Ok(env_default(key, &default.to_string()).parse()?)
-}
-#[allow(dead_code)]
-fn parse_usize(key: &str, default: usize) -> Result<usize> {
-    Ok(env_default(key, &default.to_string()).parse()?)
-}
-#[allow(dead_code)]
-fn parse_u16(key: &str, default: u16) -> Result<u16> {
-    Ok(env_default(key, &default.to_string()).parse()?)
 }
 
 fn get_required(map: &std::collections::HashMap<String, String>, key: &str) -> Result<String> {
@@ -313,9 +288,6 @@ fn parse_u16_map(
     default: u16,
 ) -> Result<u16> {
     Ok(get_default_map(map, key, &default.to_string()).parse()?)
-}
-fn normalize_table(s: &str) -> String {
-    s.replace('[', "").replace(']', "").to_ascii_lowercase()
 }
 
 #[cfg(test)]

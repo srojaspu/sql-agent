@@ -18,6 +18,7 @@ use crate::{
         schema::{ColumnMatch, ForeignKeyInfo, TableDetail},
         ColumnInfo, TableInfo,
     },
+    util::split_table_name,
 };
 
 type TdsClient = Client<Compat<TcpStream>>;
@@ -571,16 +572,6 @@ pub fn resolve_describe_row_count(outcome: Result<Option<i64>>) -> i64 {
         Ok(Some(n)) => n,
         Ok(None) => 0,
         Err(_) => -1,
-    }
-}
-
-fn split_table_name(table: &str) -> (String, String) {
-    let cleaned = table.trim().replace('[', "").replace(']', "");
-    let p: Vec<&str> = cleaned.split('.').collect();
-    if p.len() >= 2 {
-        (p[p.len() - 2].to_owned(), p[p.len() - 1].to_owned())
-    } else {
-        ("dbo".to_owned(), cleaned)
     }
 }
 
