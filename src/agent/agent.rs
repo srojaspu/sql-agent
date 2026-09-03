@@ -1238,6 +1238,11 @@ pub fn format_table_detail(schema: &str, name: &str, detail: &TableDetail) -> St
 
     if let Some(def) = &detail.view_definition {
         out.push_str(&format!("\n[VIEW] Definición:\n{def}\n"));
+    } else {
+        // None is ambiguous: base table OR view hidden by a missing VIEW
+        // DEFINITION grant. Never stay silent so the LLM does not misread
+        // absence as "not a view".
+        out.push_str("\n[VIEW] Definición: definition unavailable (permissions) — base table or missing VIEW DEFINITION grant.\n");
     }
 
     out.push_str(&format!(
@@ -1269,7 +1274,13 @@ pub fn format_table_detail(schema: &str, name: &str, detail: &TableDetail) -> St
         }
     }
 
-    out.push_str(&format!("\nCOUNT(*): {}\n", detail.row_count));
+    // Row count -1 means unknown (bounded COUNT timed out or failed);
+    // structure/sample above are still complete, so report unknown explicitly.
+    if detail.row_count < 0 {
+        out.push_str("\nCOUNT(*): unknown (COUNT capped/timed out — structure above is complete)\n");
+    } else {
+        out.push_str(&format!("\nCOUNT(*): {}\n", detail.row_count));
+    }
     out.push_str(
         "\n→ IMPORTANTE: Esto incluye ESTRUCTURA y MUESTRA. \
          Para más DATOS usa execute_read_query con un SELECT.",
@@ -1672,6 +1683,39 @@ mod tests {
             "view definition must appear, got: {out}"
         );
         assert!(out.contains('0'), "zero count must appear, got: {out}");
+    }
+
+    #[test]
+    fn format_table_detail_none_definition_shows_permissions_hint() {
+        // Views without VIEW DEFINITION grant arrive with None; the formatter
+        // must hint instead of staying silent.
+        let d = TableDetail {
+            columns: vec![],
+            primary_keys: vec![],
+            foreign_keys: vec![],
+            view_definition: None,
+            sample_rows: vec![],
+            row_count: 10,
+        };
+        let out = format_table_detail("dbo", "VwHidden", &d);
+        assert!(
+            out.contains("definition unavailable (permissions)"),
+            "missing definition must hint permissions, got: {out}"
+        );
+    }
+
+    #[test]
+    fn format_table_detail_unknown_count_still_shows_structure() {
+        // Bounded COUNT timeout yields row_count -1; structure must survive.
+        let (s, t, mut d) = sample_detail();
+        d.row_count = -1;
+        let out = format_table_detail(&s, &t, &d);
+        assert!(out.contains("ESTRUCTURA"), "structure must survive, got: {out}");
+        assert!(out.contains("MUESTRA"), "sample section must survive, got: {out}");
+        assert!(
+            out.contains("unknown"),
+            "unknown count must be explicit, got: {out}"
+        );
     }
 
     #[tokio::test]

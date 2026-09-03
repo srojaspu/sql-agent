@@ -185,8 +185,11 @@ impl SqlServer {
         Ok(out)
     }
 
-    /// Enriched describe: columns + PK/FK + view definition + TOP 5 + COUNT(*).
+    /// Enriched describe: columns + PK/FK + view definition + TOP 5 + bounded COUNT(*).
     /// Works for zero-row tables (empty sample, count 0) and views (definition set).
+    /// COUNT is capped (TOP) and wrapped in `query_timeout_seconds` so huge views
+    /// (e.g. 436k rows hung dev-DB on full COUNT) still return structure; on
+    /// timeout/cap-exhaustion row_count is -1 (unknown) instead of failing.
     pub async fn describe_table_full(&self, table: &str) -> Result<TableDetail> {
         let (schema, name) = split_table_name(table);
         let columns = self.describe_table(table).await?;
@@ -280,16 +283,27 @@ impl SqlServer {
             }
         }
 
-        let count_sql = format!("SELECT COUNT(*) FROM {qualified}");
-        let count_rows = c
-            .query(count_sql.as_str(), &[])
-            .await?
-            .into_first_result()
-            .await?;
-        let row_count = count_rows
-            .first()
-            .and_then(|r| r.get::<i32, _>(0))
-            .unwrap_or(0) as i64;
+        let count_sql = describe_count_sql(&qualified);
+        // Bounded COUNT with timeout: a full COUNT(*) hung dev-DB on a 436k-row
+        // view, so the scan is TOP-capped and wrapped in query_timeout_seconds.
+        // COUNT failure must never fail describe — structure/sample above are kept.
+        let count_timeout = Duration::from_secs(self.config.query_timeout_seconds.max(1));
+        let count_outcome: Result<Option<i64>> = async {
+            let rows = timeout(count_timeout, c.query(count_sql.as_str(), &[]))
+                .await
+                .context("describe COUNT timeout")??
+                .into_first_result()
+                .await?;
+            Ok(rows
+                .first()
+                .and_then(|r| r.get::<i32, _>(0))
+                .map(|v| v as i64))
+        }
+        .await;
+        if let Err(e) = &count_outcome {
+            tracing::warn!("describe COUNT capped/timed out for {qualified}: {e:#}");
+        }
+        let row_count = resolve_describe_row_count(count_outcome);
 
         Ok(TableDetail {
             columns,
@@ -421,6 +435,30 @@ fn escape_like_pattern(term: &str) -> String {
 /// Quote a T-SQL identifier by wrapping in brackets, doubling any closing bracket.
 fn escape_ident(name: &str) -> String {
     format!("[{}]", name.replace(']', "]]"))
+}
+
+/// Max rows scanned by the describe COUNT. A full COUNT(*) hung dev-DB on a
+/// 436k-row view, so describe counts at most CAP+1 rows (fast bounded scan).
+pub const DESCRIBE_COUNT_CAP: i64 = 100_000;
+
+/// Build the bounded COUNT query for describe: counts up to CAP+1 rows of an
+/// already-escaped qualified name. A result of CAP+1 means "more than CAP".
+pub fn describe_count_sql(qualified: &str) -> String {
+    format!(
+        "SELECT COUNT(*) FROM (SELECT TOP {} * FROM {qualified}) AS _describe_cnt",
+        DESCRIBE_COUNT_CAP + 1
+    )
+}
+
+/// Resolve the describe COUNT outcome into a displayable row_count.
+/// Ok(Some(n)) -> n, Ok(None) -> 0, Err (timeout/driver) -> -1 (unknown).
+/// The -1 sentinel keeps the describe path returning structure instead of failing.
+pub fn resolve_describe_row_count(outcome: Result<Option<i64>>) -> i64 {
+    match outcome {
+        Ok(Some(n)) => n,
+        Ok(None) => 0,
+        Err(_) => -1,
+    }
 }
 
 fn split_table_name(table: &str) -> (String, String) {
@@ -643,5 +681,50 @@ mod tests {
             s.contains("Timen"),
             "sentinel must name the column type, got: {s}"
         );
+    }
+
+    #[test]
+    fn describe_count_sql_is_bounded_with_top_cap() {
+        let q = describe_count_sql("[dbo].[BigView]");
+        assert!(
+            q.contains("TOP 100001"),
+            "COUNT must be TOP-capped to avoid full scans, got: {q}"
+        );
+        assert!(
+            q.contains("[dbo].[BigView]"),
+            "qualified name must be preserved, got: {q}"
+        );
+        assert!(q.contains("COUNT(*)"), "must still count, got: {q}");
+    }
+
+    #[test]
+    fn resolve_describe_row_count_ok_some_returns_value() {
+        assert_eq!(resolve_describe_row_count(Ok(Some(42))), 42);
+        // CAP+1 means "more than CAP" — still a usable count, path stays alive.
+        assert_eq!(
+            resolve_describe_row_count(Ok(Some(DESCRIBE_COUNT_CAP + 1))),
+            DESCRIBE_COUNT_CAP + 1
+        );
+    }
+
+    #[test]
+    fn resolve_describe_row_count_none_is_zero_and_err_is_unknown() {
+        assert_eq!(resolve_describe_row_count(Ok(None)), 0);
+        let err: Result<Option<i64>> = Err(anyhow::anyhow!("describe COUNT timeout"));
+        assert_eq!(
+            resolve_describe_row_count(err),
+            -1,
+            "timeout must yield unknown (-1), never fail describe"
+        );
+    }
+
+    #[test]
+    fn money_tds_cap_must_cast_to_decimal_for_exactness() {
+        // TDS decodes MONEY/SMALLMONEY as f64 (raw/1e4) — binary-float rounding
+        // applies before cell_to_json runs. Exact money arithmetic must CAST to
+        // DECIMAL in SQL; DECIMAL arrives as Numeric and stays exact here.
+        // This test pins the exact DECIMAL(19,4) path the CAST workaround relies on.
+        let n = tiberius::numeric::Numeric::new_with_scale(199900, 4);
+        assert_eq!(format_numeric_value(n), "19.9900");
     }
 }
