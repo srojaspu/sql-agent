@@ -235,31 +235,35 @@ impl SqlServer {
 
     /// Enriched describe: columns + PK/FK + view definition + TOP 5 + bounded COUNT(*).
     /// Works for zero-row tables (empty sample, count 0) and views (definition set).
-    /// COUNT is capped (TOP) and wrapped in `query_timeout_seconds` so huge views
-    /// (e.g. 436k rows hung dev-DB on full COUNT) still return structure; on
-    /// timeout/cap-exhaustion row_count is -1 (unknown) instead of failing.
+    /// Uses a SINGLE connection for all six sections (columns/PK/FK/VIEW/TOP5/COUNT)
+    /// and wraps every query in `query_timeout_seconds` so a hung INFORMATION_SCHEMA
+    /// or sample scan cannot stall describe; only COUNT degrades to -1 (unknown).
+    /// COUNT is capped (TOP) so huge views (e.g. 436k rows hung dev-DB on full COUNT)
+    /// still return structure; on timeout/cap-exhaustion row_count is -1 (unknown)
+    /// instead of failing.
     pub async fn describe_table_full(&self, table: &str) -> Result<TableDetail> {
         let (schema, name) = split_table_name(table);
-        let columns = self.describe_table(table).await?;
-
+        let qt = Duration::from_secs(self.config.query_timeout_seconds.max(1));
+        // Single connection shared by every section below (no re-connect per query).
         let mut c = self.connect().await?;
+        self.verify_read_only(&mut c).await?;
+
+        // Columns (same projection/parse as `describe_table`; inlined to share `c`).
+        let stream = timeout(qt, c.query(describe_columns_query(), &[&schema, &name]))
+            .await
+            .context("describe columns timeout")??;
+        let col_rows = timeout(qt, stream.into_first_result())
+            .await
+            .context("describe columns timeout")??;
+        let columns = parse_column_rows(&col_rows);
 
         // Primary keys
-        self.verify_read_only(&mut c).await?;
-        let stream = c
-            .query(
-                "SELECT kcu.COLUMN_NAME \
-                 FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc \
-                 JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu \
-                   ON tc.CONSTRAINT_NAME=kcu.CONSTRAINT_NAME \
-                  AND tc.TABLE_SCHEMA=kcu.TABLE_SCHEMA \
-                 WHERE tc.TABLE_SCHEMA=@P1 AND tc.TABLE_NAME=@P2 \
-                   AND tc.CONSTRAINT_TYPE='PRIMARY KEY' \
-                 ORDER BY kcu.ORDINAL_POSITION",
-                &[&schema, &name],
-            )
-            .await?;
-        let pk_rows = stream.into_first_result().await?;
+        let stream = timeout(qt, c.query(describe_pk_query(), &[&schema, &name]))
+            .await
+            .context("describe PK timeout")??;
+        let pk_rows = timeout(qt, stream.into_first_result())
+            .await
+            .context("describe PK timeout")??;
         let mut primary_keys = Vec::new();
         for row in &pk_rows {
             if let Some(col) = row.get::<&str, _>(0) {
@@ -268,21 +272,12 @@ impl SqlServer {
         }
 
         // Foreign keys
-        let stream = c
-            .query(
-                "SELECT kcu.COLUMN_NAME,kcu2.TABLE_SCHEMA,kcu2.TABLE_NAME,kcu2.COLUMN_NAME \
-                 FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc \
-                 JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu \
-                   ON rc.CONSTRAINT_NAME=kcu.CONSTRAINT_NAME \
-                 JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu2 \
-                   ON rc.UNIQUE_CONSTRAINT_NAME=kcu2.CONSTRAINT_NAME \
-                  AND kcu.ORDINAL_POSITION=kcu2.ORDINAL_POSITION \
-                 WHERE kcu.TABLE_SCHEMA=@P1 AND kcu.TABLE_NAME=@P2 \
-                 ORDER BY kcu.ORDINAL_POSITION",
-                &[&schema, &name],
-            )
-            .await?;
-        let fk_rows = stream.into_first_result().await?;
+        let stream = timeout(qt, c.query(describe_fk_query(), &[&schema, &name]))
+            .await
+            .context("describe FK timeout")??;
+        let fk_rows = timeout(qt, stream.into_first_result())
+            .await
+            .context("describe FK timeout")??;
         let mut foreign_keys = Vec::new();
         for row in &fk_rows {
             if let (Some(col), Some(rs), Some(rt), Some(rc)) = (
@@ -301,14 +296,12 @@ impl SqlServer {
         }
 
         // View definition (None for base tables)
-        let stream = c
-            .query(
-                "SELECT VIEW_DEFINITION FROM INFORMATION_SCHEMA.VIEWS \
-                 WHERE TABLE_SCHEMA=@P1 AND TABLE_NAME=@P2",
-                &[&schema, &name],
-            )
-            .await?;
-        let view_rows = stream.into_first_result().await?;
+        let stream = timeout(qt, c.query(describe_view_query(), &[&schema, &name]))
+            .await
+            .context("describe VIEW timeout")??;
+        let view_rows = timeout(qt, stream.into_first_result())
+            .await
+            .context("describe VIEW timeout")??;
         let view_definition = view_rows
             .first()
             .and_then(|r| r.get::<&str, _>(0))
@@ -319,9 +312,16 @@ impl SqlServer {
         let sample_sql = format!("SELECT TOP 5 * FROM {qualified}");
         let mut sample_rows = Vec::new();
         {
-            let stream = c.query(sample_sql.as_str(), &[]).await?;
-            let mut sample_stream = stream;
-            while let Some(item) = sample_stream.try_next().await? {
+            let mut sample_stream = timeout(qt, c.query(sample_sql.as_str(), &[]))
+                .await
+                .context("describe sample timeout")??;
+            loop {
+                let next = timeout(qt, sample_stream.try_next())
+                    .await
+                    .context("describe sample timeout")??;
+                let Some(item) = next else {
+                    break;
+                };
                 if let QueryItem::Row(row) = item {
                     let mut obj = serde_json::Map::new();
                     for (i, col) in row.columns().iter().enumerate() {
@@ -336,13 +336,14 @@ impl SqlServer {
         // Bounded COUNT with timeout: a full COUNT(*) hung dev-DB on a 436k-row
         // view, so the scan is TOP-capped and wrapped in query_timeout_seconds.
         // COUNT failure must never fail describe — structure/sample above are kept.
-        let count_timeout = Duration::from_secs(self.config.query_timeout_seconds.max(1));
+        let count_timeout = qt;
         let count_outcome: Result<Option<i64>> = async {
-            let rows = timeout(count_timeout, c.query(count_sql.as_str(), &[]))
+            let stream = timeout(count_timeout, c.query(count_sql.as_str(), &[]))
                 .await
-                .context("describe COUNT timeout")??
-                .into_first_result()
-                .await?;
+                .context("describe COUNT timeout")??;
+            let rows = timeout(count_timeout, stream.into_first_result())
+                .await
+                .context("describe COUNT timeout")??;
             Ok(rows
                 .first()
                 .and_then(|r| r.get::<i32, _>(0))
@@ -369,33 +370,10 @@ impl SqlServer {
         let mut c = self.connect().await?;
         self.verify_read_only(&mut c).await?;
         let stream = c
-            .query(
-                "SELECT COLUMN_NAME,DATA_TYPE,IS_NULLABLE,ORDINAL_POSITION \
-             FROM INFORMATION_SCHEMA.COLUMNS \
-             WHERE TABLE_SCHEMA=@P1 AND TABLE_NAME=@P2 \
-             ORDER BY ORDINAL_POSITION",
-                &[&schema, &name],
-            )
+            .query(describe_columns_query(), &[&schema, &name])
             .await?;
         let rows = stream.into_first_result().await?;
-
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            if let (Some(column), Some(data_type), Some(nullable), Some(ordinal)) = (
-                row.get::<&str, _>(0),
-                row.get::<&str, _>(1),
-                row.get::<&str, _>(2),
-                row.get::<i32, _>(3),
-            ) {
-                out.push(ColumnInfo {
-                    column: column.into(),
-                    data_type: data_type.into(),
-                    nullable: nullable.eq_ignore_ascii_case("YES"),
-                    ordinal,
-                });
-            }
-        }
-        Ok(out)
+        Ok(parse_column_rows(&rows))
     }
 
     pub async fn execute_read(&self, sql: &str) -> Result<QueryResult> {
@@ -485,6 +463,68 @@ fn escape_like_pattern(term: &str) -> String {
 /// Quote a T-SQL identifier by wrapping in brackets, doubling any closing bracket.
 fn escape_ident(name: &str) -> String {
     format!("[{}]", name.replace(']', "]]"))
+}
+
+/// Columns section of describe (shared by `describe_table` and
+/// `describe_table_full` so both return identical column projections).
+fn describe_columns_query() -> &'static str {
+    "SELECT COLUMN_NAME,DATA_TYPE,IS_NULLABLE,ORDINAL_POSITION \
+     FROM INFORMATION_SCHEMA.COLUMNS \
+     WHERE TABLE_SCHEMA=@P1 AND TABLE_NAME=@P2 \
+     ORDER BY ORDINAL_POSITION"
+}
+
+/// Primary-key section of describe (parameterized by schema/table).
+fn describe_pk_query() -> &'static str {
+    "SELECT kcu.COLUMN_NAME \
+     FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc \
+     JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu \
+       ON tc.CONSTRAINT_NAME=kcu.CONSTRAINT_NAME \
+      AND tc.TABLE_SCHEMA=kcu.TABLE_SCHEMA \
+     WHERE tc.TABLE_SCHEMA=@P1 AND tc.TABLE_NAME=@P2 \
+       AND tc.CONSTRAINT_TYPE='PRIMARY KEY' \
+     ORDER BY kcu.ORDINAL_POSITION"
+}
+
+/// Foreign-key section of describe (parameterized by schema/table).
+fn describe_fk_query() -> &'static str {
+    "SELECT kcu.COLUMN_NAME,kcu2.TABLE_SCHEMA,kcu2.TABLE_NAME,kcu2.COLUMN_NAME \
+     FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc \
+     JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu \
+       ON rc.CONSTRAINT_NAME=kcu.CONSTRAINT_NAME \
+     JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu2 \
+       ON rc.UNIQUE_CONSTRAINT_NAME=kcu2.CONSTRAINT_NAME \
+      AND kcu.ORDINAL_POSITION=kcu2.ORDINAL_POSITION \
+     WHERE kcu.TABLE_SCHEMA=@P1 AND kcu.TABLE_NAME=@P2 \
+     ORDER BY kcu.ORDINAL_POSITION"
+}
+
+/// View-definition section of describe (parameterized by schema/table).
+fn describe_view_query() -> &'static str {
+    "SELECT VIEW_DEFINITION FROM INFORMATION_SCHEMA.VIEWS \
+     WHERE TABLE_SCHEMA=@P1 AND TABLE_NAME=@P2"
+}
+
+/// Shared column-row parser so `describe_table` and `describe_table_full`
+/// map INFORMATION_SCHEMA.COLUMNS identically.
+fn parse_column_rows(rows: &[tiberius::Row]) -> Vec<ColumnInfo> {
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let (Some(column), Some(data_type), Some(nullable), Some(ordinal)) = (
+            row.get::<&str, _>(0),
+            row.get::<&str, _>(1),
+            row.get::<&str, _>(2),
+            row.get::<i32, _>(3),
+        ) {
+            out.push(ColumnInfo {
+                column: column.into(),
+                data_type: data_type.into(),
+                nullable: nullable.eq_ignore_ascii_case("YES"),
+                ordinal,
+            });
+        }
+    }
+    out
 }
 
 /// Max rows scanned by the describe COUNT. A full COUNT(*) hung dev-DB on a
@@ -806,6 +846,52 @@ mod tests {
             -1,
             "timeout must yield unknown (-1), never fail describe"
         );
+    }
+
+    #[test]
+    fn describe_sections_stay_parameterized_and_complete() {
+        // P1a-5: describe_table_full must keep the same six sections over one
+        // connection: columns + PK + FK + VIEW + TOP5 sample + bounded COUNT.
+        // Every INFORMATION_SCHEMA section stays parameterized (@P1/@P2) so no
+        // table name is ever interpolated; only the TOP5/COUNT qualified name
+        // is escaped via escape_ident.
+        for q in [
+            describe_columns_query(),
+            describe_pk_query(),
+            describe_fk_query(),
+            describe_view_query(),
+        ] {
+            assert!(
+                q.contains("@P1") && q.contains("@P2"),
+                "describe section must stay parameterized, got: {q}"
+            );
+        }
+        assert!(
+            describe_columns_query().contains("INFORMATION_SCHEMA.COLUMNS"),
+            "columns section must read COLUMNS"
+        );
+        assert!(
+            describe_pk_query().contains("PRIMARY KEY"),
+            "PK section must filter PRIMARY KEY"
+        );
+        assert!(
+            describe_fk_query().contains("REFERENTIAL_CONSTRAINTS"),
+            "FK section must read REFERENTIAL_CONSTRAINTS"
+        );
+        assert!(
+            describe_view_query().contains("INFORMATION_SCHEMA.VIEWS"),
+            "view section must read VIEWS"
+        );
+    }
+
+    #[test]
+    fn describe_columns_query_matches_single_table_projection() {
+        // describe_table and describe_table_full share this projection, so the
+        // single-connection refactor cannot drift column sections apart.
+        let q = describe_columns_query();
+        for col in ["COLUMN_NAME", "DATA_TYPE", "IS_NULLABLE", "ORDINAL_POSITION"] {
+            assert!(q.contains(col), "columns query must select {col}, got: {q}");
+        }
     }
 
     #[test]

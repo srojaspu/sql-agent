@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::{
     audit,
     config::Config,
-    database::schema::{upsert_schema_memory, ColumnMatch, TableDetail},
-    database::{SqlServer, TableInfo},
+    database::schema::{upsert_schema_memory, ColumnMatch, SchemaMemory, TableDetail},
+    database::{ColumnInfo, SqlServer, TableInfo},
     llm::{Message, Ollama, ToolCall},
     security::{SecurityPolicy, SqlValidator},
 };
@@ -22,10 +22,34 @@ use crate::agent::{
     tools,
 };
 
+/// Precomputed normalized names for one cached table, built once per
+/// `cached_schema` load so ranking never calls `normalize_term` per query.
+#[derive(Clone, Debug)]
+pub struct NormalizedEntry {
+    pub norm_full: String,
+    pub norm_table: String,
+}
+
+/// Precompute normalized (`schema.table` and `table`) names once per cache load.
+/// Ranking helpers take this slice instead of normalizing per table per call.
+pub fn precompute_normalized(tables: &[TableInfo]) -> Vec<NormalizedEntry> {
+    tables
+        .iter()
+        .map(|t| {
+            let full = format!("{}.{}", t.schema, t.table);
+            NormalizedEntry {
+                norm_full: normalize_term(&full),
+                norm_table: normalize_term(&t.table),
+            }
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 struct SchemaCache {
     expires_at: Instant,
-    tables: Vec<TableInfo>,
+    tables: Arc<Vec<TableInfo>>,
+    normalized: Arc<Vec<NormalizedEntry>>,
 }
 
 pub struct Agent {
@@ -452,30 +476,21 @@ impl Agent {
                     .unwrap_or("")
                     .trim()
                     .to_string();
-                let result = self.search_schema(&args).await?;
-                // Update schema memory: parse matched tables from result? For now, try to extract from cached tables
-                // We use search_with_fallback to get matched tables and upsert
-                if let Ok(tables) = self.cached_tables().await {
-                    let allowed: Vec<TableInfo> = tables
-                        .iter()
-                        .filter(|t| self.table_allowed(&t.schema, &t.table))
-                        .cloned()
-                        .collect();
-                    let (matched, _) =
-                        search_with_fallback(&query_raw, &allowed, self.config.max_schema_results);
-                    for tbl in &matched {
-                        let key = format!("{}.{}", tbl.schema, tbl.table);
-                        // Try to get columns for memory entry (best effort)
-                        let cols = self.db.describe_table(&key).await.unwrap_or_default();
-                        upsert_schema_memory(
-                            &mut session.schema_memory,
-                            key,
-                            tbl.clone(),
-                            cols,
-                            Some(query_raw.clone()),
-                            self.config.schema_cache_seconds,
-                        );
-                    }
+                // Single ranking inside; reuse `matched` for memory (no
+                // second search_with_fallback, no per-table describe calls).
+                let (result, matched) = self.search_schema_ranked(&query_raw).await?;
+                for tbl in matched.iter().take(MEMORY_GROUNDING_LIMIT) {
+                    let key = format!("{}.{}", tbl.schema, tbl.table);
+                    // No DB fetch: ground with table identity + synonym only.
+                    // Empty columns preserve any previously stored full list.
+                    upsert_schema_memory(
+                        &mut session.schema_memory,
+                        key,
+                        tbl.clone(),
+                        Vec::new(),
+                        Some(query_raw.clone()),
+                        self.config.schema_cache_seconds,
+                    );
                 }
                 Ok(result)
             }
@@ -486,27 +501,25 @@ impl Agent {
                     .unwrap_or("")
                     .trim()
                     .to_string();
-                let result = self.describe_table_tool(&args).await?;
-                // Upsert schema memory for described table
+                // Single describe_table_full fetch; reuse its columns for
+                // memory instead of a second describe_table DB call.
+                let (result, cols) = self.describe_table_tool_with_detail(&args).await?;
                 let (schema, name) = split_table(&table);
                 let key = format!("{}.{}", schema, name);
-                // Try to get columns to store
-                if let Ok(cols) = self.db.describe_table(&key).await {
-                    let tbl = TableInfo {
-                        schema: schema.clone(),
-                        table: name.clone(),
-                        // Real type travels on discovery lists; unknown on this path.
-                        table_type: String::new(),
-                    };
-                    upsert_schema_memory(
-                        &mut session.schema_memory,
-                        key,
-                        tbl,
-                        cols,
-                        Some(table.clone()),
-                        self.config.schema_cache_seconds,
-                    );
-                }
+                let tbl = TableInfo {
+                    schema: schema.clone(),
+                    table: name.clone(),
+                    // Real type travels on discovery lists; unknown on this path.
+                    table_type: String::new(),
+                };
+                upsert_schema_memory(
+                    &mut session.schema_memory,
+                    key,
+                    tbl,
+                    cols,
+                    Some(table.clone()),
+                    self.config.schema_cache_seconds,
+                );
                 Ok(result)
             }
             "list_tables" => self.list_tables_tool().await,
@@ -518,24 +531,14 @@ impl Agent {
                     .trim()
                     .to_string();
                 let matches = self.search_columns_data(&query).await?;
-                // Ground memory on the matched tables (bounded, best effort).
-                for m in matches.iter().take(5) {
-                    let key = format!("{}.{}", m.schema, m.table);
-                    if let Ok(cols) = self.db.describe_table(&key).await {
-                        upsert_schema_memory(
-                            &mut session.schema_memory,
-                            key,
-                            TableInfo {
-                                schema: m.schema.clone(),
-                                table: m.table.clone(),
-                                table_type: String::new(),
-                            },
-                            cols,
-                            Some(query.clone()),
-                            self.config.schema_cache_seconds,
-                        );
-                    }
-                }
+                // Reuse already-fetched match rows for memory (deduped by
+                // table, max MEMORY_GROUNDING_LIMIT tables, zero DB calls).
+                ground_memory_from_column_matches(
+                    &mut session.schema_memory,
+                    &matches,
+                    &query,
+                    self.config.schema_cache_seconds,
+                );
                 Ok(limit_text(
                     &format_column_matches(&matches, &query),
                     self.config.max_tool_result_chars,
@@ -584,24 +587,28 @@ impl Agent {
      * ================================================================
      */
 
-    async fn search_schema(&self, args: &Value) -> Result<String> {
-        let query_raw = args
-            .get("query")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
-
-        let tables = self.cached_tables().await?;
-
-        let allowed: Vec<TableInfo> = tables
+    /// Single-ranking search: one cache snapshot + one masked ranking pass.
+    /// Returns (formatted_output, matched) so history dispatch reuses `matched`
+    /// for memory without a second `search_with_fallback` call. The zero-hit
+    /// top list comes from the same ranking pass (no re-rank loop).
+    async fn search_schema_ranked(&self, query_raw: &str) -> Result<(String, Vec<TableInfo>)> {
+        let snapshot = self.cached_schema().await?;
+        let tables: &[TableInfo] = &snapshot.tables;
+        let norm: &[NormalizedEntry] = &snapshot.normalized;
+        // Allowlist mask avoids cloning the full table Vec into `allowed`.
+        let mask: Vec<bool> = tables
             .iter()
-            .filter(|t| self.table_allowed(&t.schema, &t.table))
-            .cloned()
+            .map(|t| self.table_allowed(&t.schema, &t.table))
             .collect();
+        let allowed_count = mask.iter().filter(|&&b| b).count();
 
-        let (matched, did_you_mean) =
-            search_with_fallback(&query_raw, &allowed, self.config.max_schema_results);
+        let (matched, did_you_mean, top) = search_with_fallback_masked(
+            query_raw,
+            tables,
+            norm,
+            Some(&mask),
+            self.config.max_schema_results,
+        );
 
         if self.config.verbose {
             println!("🔎 search_schema → {} coincidencias", matched.len());
@@ -613,31 +620,7 @@ impl Agent {
 
         if matched.is_empty() {
             output.push_str("No se encontraron tablas.\n");
-            if let Some(suggestion) = did_you_mean {
-                // Top-K suggestions ranked by Levenshtein for the empty-result case
-                let norm_query = query_raw
-                    .split_whitespace()
-                    .map(normalize_term)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let mut ranked_all: Vec<(TableInfo, usize)> = allowed
-                    .iter()
-                    .map(|t| {
-                        let nt = normalize_term(&t.table);
-                        let score = if norm_query.is_empty() {
-                            0
-                        } else {
-                            levenshtein(&norm_query, &nt)
-                        };
-                        (t.clone(), score)
-                    })
-                    .collect();
-                ranked_all.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.table.cmp(&b.0.table)));
-                let top: Vec<TableInfo> = ranked_all
-                    .into_iter()
-                    .take(self.config.max_schema_results)
-                    .map(|(t, _)| t)
-                    .collect();
+            if let Some(suggestion) = did_you_mean.clone() {
                 if !top.is_empty() {
                     output.push_str("\nSugerencias (top):\n");
                     for t in &top {
@@ -660,7 +643,7 @@ impl Agent {
                     "Si el resultado es 0, NO llames a describe_table ni \
                      execute_read_query con nombres inventados.\n",
                 );
-            } else if allowed.is_empty() {
+            } else if allowed_count == 0 {
                 output.push_str("→ No hay tablas visibles para tu filtro.\n");
             }
         } else {
@@ -677,7 +660,20 @@ impl Agent {
             );
         }
 
-        Ok(limit_text(&output, self.config.max_tool_result_chars))
+        Ok((
+            limit_text(&output, self.config.max_tool_result_chars),
+            matched,
+        ))
+    }
+
+    async fn search_schema(&self, args: &Value) -> Result<String> {
+        let query_raw = args
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        Ok(self.search_schema_ranked(&query_raw).await?.0)
     }
 
     /*
@@ -686,7 +682,13 @@ impl Agent {
      * ================================================================
      */
 
-    async fn describe_table_tool(&self, args: &Value) -> Result<String> {
+    /// Describe once and return (formatted_output, columns): history dispatch
+    /// reuses `columns` for schema memory instead of a second `describe_table`
+    /// DB call. Single `describe_table_full` fetch, same format as before.
+    async fn describe_table_tool_with_detail(
+        &self,
+        args: &Value,
+    ) -> Result<(String, Vec<crate::database::ColumnInfo>)> {
         let table = args
             .get("table")
             .and_then(Value::as_str)
@@ -712,10 +714,17 @@ impl Agent {
             .describe_table_full(&format!("{}.{}", schema, name))
             .await?;
 
-        Ok(limit_text(
-            &format_table_detail(&schema, &name, &detail),
-            self.config.max_tool_result_chars,
+        Ok((
+            limit_text(
+                &format_table_detail(&schema, &name, &detail),
+                self.config.max_tool_result_chars,
+            ),
+            detail.columns,
         ))
+    }
+
+    async fn describe_table_tool(&self, args: &Value) -> Result<String> {
+        Ok(self.describe_table_tool_with_detail(args).await?.0)
     }
 
     /*
@@ -812,11 +821,13 @@ impl Agent {
             Err(e) => {
                 let msg = e.to_string();
                 if msg.to_ascii_lowercase().contains("invalid object name") {
-                    // Re-inject candidates (top 17) for self-correction within MAX_STEPS
+                    // Re-inject candidates (top 17) for self-correction within MAX_STEPS.
+                    // Clone at most 17 entries; the cache itself stays a shared Arc.
                     let tables = self.cached_tables().await.unwrap_or_default();
                     let allowed: Vec<TableInfo> = tables
                         .iter()
                         .filter(|t| self.table_allowed(&t.schema, &t.table))
+                        .take(17)
                         .cloned()
                         .collect();
                     let out = format_invalid_reinject(&allowed, &msg);
@@ -901,7 +912,10 @@ impl Agent {
      * ================================================================
      */
 
-    async fn cached_tables(&self) -> Result<Vec<TableInfo>> {
+    /// Cheap snapshot of the schema cache: clones two `Arc`s, never the table Vec.
+    /// Ranking callers use `snapshot.tables` as a slice plus `snapshot.normalized`
+    /// so `normalize_term` runs once per cache load, not per table per query.
+    async fn cached_schema(&self) -> Result<SchemaCache> {
         {
             let guard = self.schema.read().await;
 
@@ -911,7 +925,7 @@ impl Agent {
                         println!("⚡ Esquema desde caché");
                     }
 
-                    return Ok(cache.tables.clone());
+                    return Ok(cache.clone());
                 }
             }
         }
@@ -951,15 +965,22 @@ impl Agent {
         }
 
         /*
-         * Guardamos copia del esquema.
+         * Guardamos copia del esquema with precomputed normalized names.
          */
 
-        *self.schema.write().await = Some(SchemaCache {
+        let cache = SchemaCache {
             expires_at: Instant::now() + Duration::from_secs(self.config.schema_cache_seconds),
-            tables: tables.clone(),
-        });
+            normalized: Arc::new(precompute_normalized(&tables)),
+            tables: Arc::new(tables),
+        };
+        *self.schema.write().await = Some(cache.clone());
 
-        Ok(tables)
+        Ok(cache)
+    }
+
+    /// Tables-only view of the cache (cheap `Arc` clone, no Vec copy).
+    async fn cached_tables(&self) -> Result<Arc<Vec<TableInfo>>> {
+        Ok(self.cached_schema().await?.tables)
     }
 
     /*
@@ -1340,6 +1361,81 @@ pub fn format_invalid_reinject(candidates: &[TableInfo], error_msg: &str) -> Str
     out
 }
 
+/// Max tables grounded into schema memory per search tool call.
+/// Bounds the old fan-out (one describe per match) now replaced by data reuse.
+pub const MEMORY_GROUNDING_LIMIT: usize = 5;
+
+/// Group column matches by table (deduped, at most `limit` tables) and convert
+/// the already-fetched match rows into memory columns — zero DB calls.
+/// Nullable defaults to true (conservative) and ordinal to 0 (unknown); full
+/// column lists still arrive via `describe_table`, which overwrites these.
+pub fn memory_columns_for_column_matches(
+    matches: &[ColumnMatch],
+    limit: usize,
+) -> Vec<(String, TableInfo, Vec<ColumnInfo>)> {
+    use std::collections::HashMap;
+    let mut grouped: HashMap<String, (TableInfo, Vec<ColumnInfo>)> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for m in matches {
+        if grouped.len() >= limit && !grouped.contains_key(&format!("{}.{}", m.schema, m.table)) {
+            continue;
+        }
+        let key = format!("{}.{}", m.schema, m.table);
+        let entry = grouped.entry(key.clone()).or_insert_with(|| {
+            order.push(key.clone());
+            (
+                TableInfo {
+                    schema: m.schema.clone(),
+                    table: m.table.clone(),
+                    table_type: String::new(),
+                },
+                Vec::new(),
+            )
+        });
+        if !entry.1.iter().any(|c| c.column == m.column) {
+            entry.1.push(ColumnInfo {
+                column: m.column.clone(),
+                data_type: m.data_type.clone(),
+                nullable: true,
+                ordinal: 0,
+            });
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|k| grouped.remove(&k).map(|(t, c)| (k, t, c)))
+        .collect()
+}
+
+/// Ground schema memory from already-fetched column matches (no DB calls).
+/// Merge-safe: existing entries keep their full column list and only gain
+/// missing matched columns plus the new synonym; new tables store the partial
+/// matched columns until `describe_table` grounds them fully.
+pub fn ground_memory_from_column_matches(
+    memory: &mut SchemaMemory,
+    matches: &[ColumnMatch],
+    query: &str,
+    ttl_seconds: u64,
+) {
+    for (key, tbl, cols) in memory_columns_for_column_matches(matches, MEMORY_GROUNDING_LIMIT) {
+        if let Some(existing) = memory.get_mut(&key) {
+            existing.last_used = chrono::Utc::now();
+            existing.hit_count += 1;
+            if !existing.synonyms.contains(&query.to_string()) {
+                existing.synonyms.push(query.to_string());
+            }
+            for c in cols {
+                if !existing.columns.iter().any(|e| e.column == c.column) {
+                    existing.columns.push(c);
+                }
+            }
+            existing.ttl_seconds = ttl_seconds;
+        } else {
+            upsert_schema_memory(memory, key, tbl, cols, Some(query.to_string()), ttl_seconds);
+        }
+    }
+}
+
 /// Pure ranking helper used by `search_schema` and tests.
 /// Returns ranked matches after AND→OR fallback, truncated to `max_results`.
 /// For empty query, returns first `max_results` tables (no ranking).
@@ -1353,101 +1449,145 @@ pub fn filter_and_rank_tables(
     ranked
 }
 
+/// Score helper shared by every ranking phase (single-term vs multi-term).
+fn rank_score(terms: &[String], norm_query_joined: &str, norm_table: &str) -> usize {
+    if terms.len() == 1 {
+        levenshtein(norm_query_joined, norm_table)
+    } else {
+        terms
+            .iter()
+            .map(|term| levenshtein(term, norm_table))
+            .min()
+            .unwrap_or(usize::MAX)
+    }
+}
+
+/// Core ranking over precomputed normalized names with an allowlist mask.
+/// Returns (matched, suggestion, top_suggestions): the zero-hit full ranking is
+/// computed ONCE here, so callers reuse `top_suggestions` instead of re-ranking.
+/// Only matched/suggested entries are cloned (never the full table Vec).
+/// `allowed[i] == false` skips `tables[i]`; `None` means every entry is allowed.
+pub fn search_with_fallback_masked(
+    query: &str,
+    tables: &[TableInfo],
+    norm: &[NormalizedEntry],
+    allowed: Option<&[bool]>,
+    max_results: usize,
+) -> (Vec<TableInfo>, Option<TableInfo>, Vec<TableInfo>) {
+    debug_assert_eq!(tables.len(), norm.len());
+    let q = query.trim();
+    if q.is_empty() {
+        let ranked: Vec<TableInfo> = tables
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| allowed.map_or(true, |m| m[*i]))
+            .take(max_results)
+            .map(|(_, t)| t.clone())
+            .collect();
+        return (ranked, None, Vec::new());
+    }
+    let terms: Vec<String> = q.split_whitespace().map(normalize_term).collect();
+    let norm_query_joined = terms.join(" ");
+    let is_allowed = |i: usize| allowed.map_or(true, |m| m[i]);
+
+    // AND phase (indices only; clone after truncate)
+    let mut and_matches: Vec<(usize, usize)> = Vec::new();
+    for (i, n) in norm.iter().enumerate() {
+        if !is_allowed(i) {
+            continue;
+        }
+        let all_contain = terms
+            .iter()
+            .all(|term| n.norm_full.contains(term) || n.norm_table.contains(term));
+        if all_contain {
+            and_matches.push((i, rank_score(&terms, &norm_query_joined, &n.norm_table)));
+        }
+    }
+    if !and_matches.is_empty() {
+        and_matches.sort_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| tables[a.0].table.cmp(&tables[b.0].table))
+        });
+        let out: Vec<TableInfo> = and_matches
+            .into_iter()
+            .take(max_results)
+            .map(|(i, _)| tables[i].clone())
+            .collect();
+        return (out, None, Vec::new());
+    }
+
+    // OR phase
+    let mut or_matches: Vec<(usize, usize)> = Vec::new();
+    for (i, n) in norm.iter().enumerate() {
+        if !is_allowed(i) {
+            continue;
+        }
+        let any_contain = terms
+            .iter()
+            .any(|term| n.norm_full.contains(term) || n.norm_table.contains(term));
+        if any_contain {
+            or_matches.push((i, rank_score(&terms, &norm_query_joined, &n.norm_table)));
+        }
+    }
+    if !or_matches.is_empty() {
+        or_matches.sort_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| tables[a.0].table.cmp(&tables[b.0].table))
+        });
+        let out: Vec<TableInfo> = or_matches
+            .into_iter()
+            .take(max_results)
+            .map(|(i, _)| tables[i].clone())
+            .collect();
+        return (out, None, Vec::new());
+    }
+
+    // Zero matches → Did-you-mean: single ranking pass yields both the closest
+    // suggestion and the truncated top list, so callers never re-rank.
+    let mut all_ranked: Vec<(usize, usize)> = norm
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| is_allowed(*i))
+        .map(|(i, n)| (i, levenshtein(&norm_query_joined, &n.norm_table)))
+        .collect();
+    all_ranked.sort_by(|a, b| {
+        a.1.cmp(&b.1)
+            .then_with(|| tables[a.0].table.cmp(&tables[b.0].table))
+    });
+    let suggestion = all_ranked.first().map(|(i, _)| tables[*i].clone());
+    let top: Vec<TableInfo> = all_ranked
+        .iter()
+        .take(max_results)
+        .map(|(i, _)| tables[*i].clone())
+        .collect();
+    // Return empty ranked but with suggestion; caller will format 0 + Did-you-mean
+    (Vec::new(), suggestion, top)
+}
+
+/// Ranking over precomputed normalized names (single pass, no per-call normalize).
+pub fn search_with_fallback_precomputed(
+    query: &str,
+    tables: &[TableInfo],
+    norm: &[NormalizedEntry],
+    max_results: usize,
+) -> (Vec<TableInfo>, Option<TableInfo>) {
+    let (matched, suggestion, _) =
+        search_with_fallback_masked(query, tables, norm, None, max_results);
+    (matched, suggestion)
+}
+
 /// Returns (ranked_matches, did_you_mean) where `did_you_mean` is Some(closest)
 /// when no matches were found (for Did-you-mean suggestion). When query is empty,
 /// `did_you_mean` is None and `ranked` is truncated list.
+/// Compat wrapper: precomputes normalized names once, then delegates to the
+/// masked core so ordering matches `search_with_fallback_precomputed` exactly.
 pub fn search_with_fallback(
     query: &str,
     tables: &[TableInfo],
     max_results: usize,
 ) -> (Vec<TableInfo>, Option<TableInfo>) {
-    let q = query.trim();
-    if q.is_empty() {
-        let mut all = tables.to_vec();
-        all.truncate(max_results);
-        return (all, None);
-    }
-    let terms: Vec<String> = q.split_whitespace().map(normalize_term).collect();
-    let norm_query_joined = terms.join(" ");
-
-    // Helper to compute normalized full/table for a TableInfo
-    let norm_for = |t: &TableInfo| -> (String, String) {
-        let full = format!("{}.{}", t.schema, t.table);
-        let nf = normalize_term(&full);
-        let nt = normalize_term(&t.table);
-        (nf, nt)
-    };
-
-    // AND phase
-    let mut and_matches: Vec<(TableInfo, usize)> = Vec::new();
-    for t in tables {
-        let (nf, nt) = norm_for(t);
-        let all_contain = terms
-            .iter()
-            .all(|term| nf.contains(term) || nt.contains(term));
-        if all_contain {
-            // rank score: Levenshtein between normalized query joined and nt (or nf)
-            // Use minimum distance among terms vs table for multi-term
-            let score = if terms.len() == 1 {
-                levenshtein(&norm_query_joined, &nt)
-            } else {
-                // For multi-term, use sum of min distances per term? Simpler: min distance
-                terms
-                    .iter()
-                    .map(|term| levenshtein(term, &nt))
-                    .min()
-                    .unwrap_or(usize::MAX)
-            };
-            and_matches.push((t.clone(), score));
-        }
-    }
-    if !and_matches.is_empty() {
-        and_matches.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.table.cmp(&b.0.table)));
-        let mut out: Vec<TableInfo> = and_matches.into_iter().map(|(t, _)| t).collect();
-        out.truncate(max_results);
-        return (out, None);
-    }
-
-    // OR phase
-    let mut or_matches: Vec<(TableInfo, usize)> = Vec::new();
-    for t in tables {
-        let (nf, nt) = norm_for(t);
-        let any_contain = terms
-            .iter()
-            .any(|term| nf.contains(term) || nt.contains(term));
-        if any_contain {
-            let score = if terms.len() == 1 {
-                levenshtein(&norm_query_joined, &nt)
-            } else {
-                terms
-                    .iter()
-                    .map(|term| levenshtein(term, &nt))
-                    .min()
-                    .unwrap_or(usize::MAX)
-            };
-            or_matches.push((t.clone(), score));
-        }
-    }
-    if !or_matches.is_empty() {
-        or_matches.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.table.cmp(&b.0.table)));
-        let mut out: Vec<TableInfo> = or_matches.into_iter().map(|(t, _)| t).collect();
-        out.truncate(max_results);
-        return (out, None);
-    }
-
-    // Zero matches → Did-you-mean: rank all by Levenshtein and suggest closest
-    let mut all_ranked: Vec<(TableInfo, usize)> = tables
-        .iter()
-        .map(|t| {
-            let (_, nt) = norm_for(t);
-            let score = levenshtein(&norm_query_joined, &nt);
-            (t.clone(), score)
-        })
-        .collect();
-    all_ranked.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.table.cmp(&b.0.table)));
-    let suggestion = all_ranked.first().map(|(t, _)| t.clone());
-    // Return empty ranked but with suggestion; caller will format 0 + Did-you-mean
-    (Vec::new(), suggestion)
+    let norm = precompute_normalized(tables);
+    search_with_fallback_precomputed(query, tables, &norm, max_results)
 }
 
 #[cfg(test)]
@@ -1954,7 +2094,8 @@ mod tests {
             let mut guard = agent.schema.write().await;
             *guard = Some(SchemaCache {
                 expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
-                tables: vec![],
+                tables: Arc::new(vec![]),
+                normalized: Arc::new(vec![]),
             });
         }
         let res = agent
@@ -1991,5 +2132,221 @@ mod tests {
         let mut session = crate::agent::session::Session::new();
         let res = agent.run_with_history(&mut session, "   ").await;
         assert!(res.is_err());
+    }
+
+    // ===== P1a-6 dispatch data reuse (same formats, fewer DB calls) =====
+    use std::collections::HashMap;
+
+    fn column_matches_for_memory_test() -> Vec<ColumnMatch> {
+        vec![
+            ColumnMatch {
+                schema: "dbo".into(),
+                table: "Orders".into(),
+                column: "email".into(),
+                data_type: "nvarchar".into(),
+            },
+            ColumnMatch {
+                schema: "dbo".into(),
+                table: "Orders".into(),
+                column: "id".into(),
+                data_type: "int".into(),
+            },
+            ColumnMatch {
+                schema: "dbo".into(),
+                table: "Usuario".into(),
+                column: "email".into(),
+                data_type: "nvarchar".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn memory_columns_dedupes_tables_and_bounds_to_five() {
+        // 12 matches across 7 tables -> at most 5 tables, first-seen order kept.
+        let matches: Vec<ColumnMatch> = (0..12)
+            .map(|i| ColumnMatch {
+                schema: "dbo".into(),
+                table: format!("Tabla{i:02}"),
+                column: "email".into(),
+                data_type: "nvarchar".into(),
+            })
+            .collect();
+        let grouped = memory_columns_for_column_matches(&matches, MEMORY_GROUNDING_LIMIT);
+        assert_eq!(
+            grouped.len(),
+            MEMORY_GROUNDING_LIMIT,
+            "fan-out must stay bounded"
+        );
+        assert_eq!(grouped[0].1.table, "Tabla00");
+        assert_eq!(grouped[4].1.table, "Tabla04");
+        // Duplicates collapse into one table entry with both columns.
+        let dupes = column_matches_for_memory_test();
+        let grouped = memory_columns_for_column_matches(&dupes, MEMORY_GROUNDING_LIMIT);
+        assert_eq!(grouped.len(), 2, "Orders+Usuario deduped, got {grouped:?}");
+        let orders = grouped.iter().find(|(_, t, _)| t.table == "Orders").unwrap();
+        assert_eq!(orders.2.len(), 2, "both Orders columns reused");
+        // Same format input preserved for the LLM formatter.
+        let out = format_column_matches(&dupes, "email");
+        assert!(out.contains("dbo.Orders.email") && out.contains("dbo.Usuario.email"));
+    }
+
+    #[test]
+    fn ground_memory_reuses_matches_with_zero_db_calls() {
+        // Simple call counter stands in for DB describes: the old path called
+        // describe once per match (up to 5); the new path calls zero.
+        struct CallCounter {
+            calls: usize,
+        }
+        impl CallCounter {
+            fn old_path_describe(&mut self, matches: &[ColumnMatch]) {
+                for _ in matches.iter().take(5) {
+                    self.calls += 1;
+                }
+            }
+        }
+        let matches = column_matches_for_memory_test();
+        let mut counter = CallCounter { calls: 0 };
+        counter.old_path_describe(&matches);
+        assert_eq!(counter.calls, 3, "old path hit DB per match");
+
+        let new_calls = 0; // ground_memory_from_column_matches takes no DB handle
+        let mut memory: crate::database::schema::SchemaMemory = HashMap::new();
+        ground_memory_from_column_matches(&mut memory, &matches, "email", 300);
+        assert_eq!(new_calls, 0);
+        assert!(new_calls < counter.calls, "new path must make fewer calls");
+        assert!(memory.contains_key("dbo.Orders"));
+        assert!(memory.contains_key("dbo.Usuario"));
+        assert_eq!(memory["dbo.Orders"].columns.len(), 2);
+    }
+
+    #[test]
+    fn ground_memory_merges_without_clobbering_full_columns() {
+        use crate::database::ColumnInfo;
+        let mut memory: crate::database::schema::SchemaMemory = HashMap::new();
+        let tbl = TableInfo {
+            schema: "dbo".into(),
+            table: "Orders".into(),
+            table_type: "BASE TABLE".into(),
+        };
+        // Previously described table holds the full column list.
+        upsert_schema_memory(
+            &mut memory,
+            "dbo.Orders".into(),
+            tbl,
+            vec![
+                ColumnInfo {
+                    column: "id".into(),
+                    data_type: "int".into(),
+                    nullable: false,
+                    ordinal: 1,
+                },
+                ColumnInfo {
+                    column: "total".into(),
+                    data_type: "decimal".into(),
+                    nullable: false,
+                    ordinal: 2,
+                },
+            ],
+            Some("orders".into()),
+            300,
+        );
+        // A later column search reuses its single matched row; full list survives.
+        let matches = vec![ColumnMatch {
+            schema: "dbo".into(),
+            table: "Orders".into(),
+            column: "email".into(),
+            data_type: "nvarchar".into(),
+        }];
+        ground_memory_from_column_matches(&mut memory, &matches, "email", 300);
+        let cols: Vec<&str> = memory["dbo.Orders"]
+            .columns
+            .iter()
+            .map(|c| c.column.as_str())
+            .collect();
+        assert!(cols.contains(&"id") && cols.contains(&"total"), "full list kept");
+        assert!(cols.contains(&"email"), "matched column merged");
+    }
+
+    #[test]
+    fn describe_reuses_detail_columns_for_memory() {
+        // Pins P1a-6: memory columns ARE the TableDetail columns from the single
+        // describe_table_full fetch — no second describe_table call exists.
+        let (_, _, detail) = sample_detail();
+        let cols_for_memory: Vec<crate::database::ColumnInfo> = detail.columns.clone();
+        assert_eq!(cols_for_memory.len(), 1);
+        assert_eq!(cols_for_memory[0].column, "id");
+        let out = format_table_detail("dbo", "Orders", &detail);
+        assert!(out.contains("ESTRUCTURA") && out.contains("MUESTRA"));
+    }
+
+    // ===== P1a-7 ranking: same order/suggestion, precomputed + single pass =====
+    #[test]
+    fn precomputed_ranking_matches_legacy_order_and_suggestion() {
+        let tables = make_tables(&[
+            ("dbo", "Usuario"),
+            ("dbo", "Producto"),
+            ("dbo", "Pedido"),
+            ("dbo", "UsuarioDireccion"),
+        ]);
+        for query in ["usuarios", "usu prod", "xyz_noexiste", "pedido", ""] {
+            let (legacy_matched, legacy_sugg) =
+                search_with_fallback(query, &tables, 20);
+            let norm = precompute_normalized(&tables);
+            let (pre_matched, pre_sugg) =
+                search_with_fallback_precomputed(query, &tables, &norm, 20);
+            let legacy_names: Vec<_> = legacy_matched
+                .iter()
+                .map(|t| format!("{}.{}", t.schema, t.table))
+                .collect();
+            let pre_names: Vec<_> = pre_matched
+                .iter()
+                .map(|t| format!("{}.{}", t.schema, t.table))
+                .collect();
+            assert_eq!(pre_names, legacy_names, "order must match for '{query}'");
+            assert_eq!(
+                pre_sugg.map(|t| t.table),
+                legacy_sugg.map(|t| t.table),
+                "suggestion must match for '{query}'"
+            );
+        }
+    }
+
+    #[test]
+    fn masked_zero_hit_returns_suggestion_and_top_from_single_pass() {
+        let tables = make_tables(&[("dbo", "Usuario"), ("dbo", "Producto")]);
+        let norm = precompute_normalized(&tables);
+        let (matched, suggestion, top) =
+            search_with_fallback_masked("xyz_noexiste", &tables, &norm, None, 20);
+        assert!(matched.is_empty());
+        let sugg = suggestion.expect("zero-hit must suggest");
+        assert!(!top.is_empty(), "top reuses the same ranking pass");
+        assert_eq!(top[0].table, sugg.table, "suggestion is top[0], no re-rank");
+        // Mask filters without cloning an `allowed` Vec.
+        let mask = vec![true, false];
+        let (masked_matched, _, masked_top) =
+            search_with_fallback_masked("", &tables, &norm, Some(&mask), 20);
+        assert_eq!(masked_matched.len(), 1);
+        assert_eq!(masked_matched[0].table, "Usuario");
+        assert!(masked_top.is_empty(), "empty query has no suggestions");
+    }
+
+    #[test]
+    fn schema_cache_clone_shares_arc_allocation() {
+        let tables = make_tables(&[("dbo", "Usuario")]);
+        let cache = SchemaCache {
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
+            normalized: Arc::new(precompute_normalized(&tables)),
+            tables: Arc::new(tables),
+        };
+        let cloned = cache.clone();
+        assert!(
+            Arc::ptr_eq(&cache.tables, &cloned.tables),
+            "snapshot clone must share the table Arc, not copy the Vec"
+        );
+        assert!(
+            Arc::ptr_eq(&cache.normalized, &cloned.normalized),
+            "normalized names must also be shared"
+        );
+        assert_eq!(cloned.normalized.len(), cloned.tables.len());
     }
 }
