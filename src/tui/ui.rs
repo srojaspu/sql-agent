@@ -45,6 +45,14 @@ pub fn parse_command(input: &str) -> Command {
 
 const HELP_TEXT: &str = "Comandos: /clear /history /tables /describe <tabla> /refresh /quit /help | Teclas: Enter enviar, Esc salir, ↑↓ scroll, PgUp/PgDn, Ctrl-C salir";
 
+/// Dirty-check for the event-driven render loop: draw only when the app
+/// version changed since the last drawn frame. Idle 50ms ticks without
+/// events leave the version untouched, so the caller can skip rebuilding
+/// all Lines entirely.
+pub fn needs_redraw(last_drawn_version: u64, app: &AppState) -> bool {
+    last_drawn_version != app.version
+}
+
 /// Split content into styled Lines preserving indentation and detecting
 /// code fences (```) and markdown pipe tables (| ... |).
 /// - code block lines: Yellow on dark bg, preserved spaces
@@ -105,7 +113,8 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
 
     // Chat pane
     let chat_lines: Vec<Line> = if app.history_visible {
-        // History view: show session messages
+        // History view: show session messages (borrowed, no per-frame clone
+        // or truncation; Paragraph wrapping handles long lines).
         if app.session.messages.is_empty() {
             vec![Line::from(Span::styled(
                 "Historial vacío",
@@ -124,7 +133,7 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
                     };
                     Line::from(vec![
                         Span::styled(format!("{}: ", m.role), Style::default().fg(role_color)),
-                        Span::raw(m.content.chars().take(200).collect::<String>()),
+                        Span::raw(m.content.as_str()),
                     ])
                 })
                 .collect()
@@ -201,14 +210,14 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
         .style(Style::default().fg(Color::White));
     frame.render_widget(chat_para, chunks[0]);
 
-    // Input pane
+    // Input pane (borrows `app.input`; no per-frame clone).
     let input_text = if app.input.is_empty() {
         Line::from(Span::styled(
             "Escribe aquí... (/help)",
             Style::default().fg(Color::DarkGray),
         ))
     } else {
-        Line::from(Span::raw(app.input.clone()))
+        Line::from(Span::raw(app.input.as_str()))
     };
     let input_block = Block::default()
         .title(" Input (Enter enviar, Esc salir) ")
@@ -231,7 +240,7 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
         .map(|t| format!(" | tool: {t} step: {}", app.current_step))
         .unwrap_or_default();
     let status_line = Line::from(vec![
-        Span::styled(app.status.clone(), Style::default().fg(status_color)),
+        Span::styled(app.status.as_str(), Style::default().fg(status_color)),
         Span::styled(tool_info, Style::default().fg(Color::DarkGray)),
     ]);
     let help_line = if app.show_help {
@@ -460,5 +469,45 @@ mod tests {
         );
         assert!(!handle_key(a, &mut app));
         assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn redraw_only_on_version_change_idle_frames_skip_render() {
+        // Cheap redraw gate: N idle frames without events must not render.
+        let mut app = make_app();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut renders = 0u32;
+        let mut last_drawn: u64;
+        // Initial draw.
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        renders += 1;
+        last_drawn = app.version;
+        // N idle frames: no events, version untouched -> skip draw.
+        for _ in 0..10 {
+            if needs_redraw(last_drawn, &app) {
+                terminal.draw(|f| draw(f, &app)).unwrap();
+                renders += 1;
+                last_drawn = app.version;
+            }
+        }
+        assert_eq!(renders, 1, "idle frames must not re-render");
+        // One keystroke bumps the version -> exactly one more render.
+        app.push_input('x');
+        if needs_redraw(last_drawn, &app) {
+            terminal.draw(|f| draw(f, &app)).unwrap();
+            renders += 1;
+            last_drawn = app.version;
+        }
+        assert_eq!(renders, 2);
+        // More idle frames after the keystroke -> still no extra renders.
+        for _ in 0..10 {
+            if needs_redraw(last_drawn, &app) {
+                terminal.draw(|f| draw(f, &app)).unwrap();
+                renders += 1;
+                last_drawn = app.version;
+            }
+        }
+        assert_eq!(renders, 2);
     }
 }

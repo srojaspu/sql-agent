@@ -84,6 +84,29 @@ impl SqlServer {
         }
     }
 
+    /// TCP connect timeout, driven by `OLLAMA_CONNECT_TIMEOUT_SECONDS`.
+    /// Reuses the existing connect-timeout knob (no new env vars) and falls
+    /// back to the historical 10s when the config value is 0.
+    fn tcp_connect_timeout(&self) -> Duration {
+        let secs = if self.config.ollama_connect_timeout_seconds > 0 {
+            self.config.ollama_connect_timeout_seconds
+        } else {
+            10
+        };
+        Duration::from_secs(secs)
+    }
+
+    /// TLS/handshake timeout, driven by `QUERY_TIMEOUT_SECONDS`.
+    /// Falls back to the historical 20s when the config value is 0.
+    fn tls_handshake_timeout(&self) -> Duration {
+        let secs = if self.config.query_timeout_seconds > 0 {
+            self.config.query_timeout_seconds
+        } else {
+            20
+        };
+        Duration::from_secs(secs)
+    }
+
     fn tds_config(&self) -> TdsConfig {
         let mut c = TdsConfig::new();
         c.host(&self.config.database_host);
@@ -108,7 +131,7 @@ impl SqlServer {
         );
 
         let tcp = timeout(
-            Duration::from_secs(10),
+            self.tcp_connect_timeout(),
             TcpStream::connect(config.get_addr()),
         )
         .await
@@ -118,7 +141,7 @@ impl SqlServer {
         tracing::debug!("✅ TCP conectado");
 
         let client = timeout(
-            Duration::from_secs(20),
+            self.tls_handshake_timeout(),
             Client::connect(config, tcp.compat_write()),
         )
         .await
@@ -892,6 +915,38 @@ mod tests {
         for col in ["COLUMN_NAME", "DATA_TYPE", "IS_NULLABLE", "ORDINAL_POSITION"] {
             assert!(q.contains(col), "columns query must select {col}, got: {q}");
         }
+    }
+
+    #[test]
+    fn connect_timeouts_follow_config_with_fallback() {
+        use crate::config::Config;
+        use std::collections::HashMap;
+        fn cfg_with(query: &str, connect: &str) -> Config {
+            let mut m = HashMap::new();
+            m.insert("DATABASE_HOST".into(), "localhost".into());
+            m.insert("DATABASE_NAME".into(), "TestDB".into());
+            m.insert("DATABASE_USER".into(), "u".into());
+            m.insert("DATABASE_PASSWORD".into(), "p".into());
+            m.insert("QUERY_TIMEOUT_SECONDS".into(), query.into());
+            m.insert("OLLAMA_CONNECT_TIMEOUT_SECONDS".into(), connect.into());
+            Config::from_map(&m).expect("config should parse")
+        }
+        // Defaults stay intact at the Config layer.
+        let defaults = cfg_with("30", "5");
+        assert_eq!(defaults.query_timeout_seconds, 30);
+        assert_eq!(defaults.ollama_connect_timeout_seconds, 5);
+        // SqlServer follows them: TCP <- connect knob, TLS <- query knob.
+        let srv = SqlServer::new(defaults);
+        assert_eq!(srv.tcp_connect_timeout(), Duration::from_secs(5));
+        assert_eq!(srv.tls_handshake_timeout(), Duration::from_secs(30));
+        // Overrides are respected.
+        let over = SqlServer::new(cfg_with("7", "2"));
+        assert_eq!(over.tcp_connect_timeout(), Duration::from_secs(2));
+        assert_eq!(over.tls_handshake_timeout(), Duration::from_secs(7));
+        // Zero falls back to the historical 10s/20s instead of a 0s timeout.
+        let fb = SqlServer::new(cfg_with("0", "0"));
+        assert_eq!(fb.tcp_connect_timeout(), Duration::from_secs(10));
+        assert_eq!(fb.tls_handshake_timeout(), Duration::from_secs(20));
     }
 
     #[test]

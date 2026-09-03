@@ -33,6 +33,10 @@ pub struct AppState {
     pub is_loading: bool,
     pub show_help: bool,
     pub history_visible: bool,
+    /// Monotonic render epoch, bumped on every visible mutation.
+    /// The TUI loop draws only when this differs from the last drawn value,
+    /// so idle frames without events skip the rebuild entirely.
+    pub version: u64,
 }
 
 impl AppState {
@@ -49,11 +53,17 @@ impl AppState {
             is_loading: false,
             show_help: false,
             history_visible: false,
+            version: 0,
         }
+    }
+
+    fn bump(&mut self) {
+        self.version = self.version.wrapping_add(1);
     }
 
     pub fn push_line(&mut self, role: impl Into<String>, content: impl Into<String>) {
         self.messages.push(ChatLine::new(role, content));
+        self.bump();
         // Auto-follow if at bottom; otherwise keep offset (user scrolled up)
         if self.scroll_offset == 0 {
             // stay at bottom — nothing to do
@@ -77,6 +87,27 @@ impl AppState {
         let truncated: String = content.into().chars().take(200).collect();
         self.tool_trace
             .push(ChatLine::new(format!("tool:{name}"), truncated));
+        self.bump();
+    }
+
+    /// Version-bumping input helpers so the render loop can dirty-check
+    /// keystrokes without polling the string every frame.
+    pub fn push_input(&mut self, c: char) {
+        self.input.push(c);
+        self.bump();
+    }
+
+    pub fn pop_input(&mut self) {
+        if self.input.pop().is_some() {
+            self.bump();
+        }
+    }
+
+    pub fn clear_input(&mut self) {
+        if !self.input.is_empty() {
+            self.input.clear();
+            self.bump();
+        }
     }
 
     pub fn clear(&mut self) {
@@ -86,10 +117,12 @@ impl AppState {
         self.status = "Historial limpiado".to_string();
         self.current_tool = None;
         self.current_step = 0;
+        self.bump();
     }
 
     pub fn set_status(&mut self, s: impl Into<String>) {
         self.status = s.into();
+        self.bump();
     }
 
     pub fn set_tool(&mut self, step: usize, tool: impl Into<String>) {
@@ -97,6 +130,7 @@ impl AppState {
         self.current_tool = Some(tool.into());
         self.status = format!("Paso {step} — {}", self.current_tool.as_ref().unwrap());
         self.is_loading = true;
+        self.bump();
     }
 
     pub fn set_done(&mut self, result: impl Into<String>) {
@@ -106,6 +140,8 @@ impl AppState {
         self.current_tool = None;
         self.is_loading = false;
         self.scroll_offset = 0; // follow bottom on done
+        // push_assistant already bumped; status/is_loading changed too.
+        self.bump();
     }
 
     pub fn set_error(&mut self, err: impl Into<String>) {
@@ -113,6 +149,8 @@ impl AppState {
         self.push_line("error", e.clone());
         self.status = format!("Error: {e}");
         self.is_loading = false;
+        // push_line already bumped; status changed too.
+        self.bump();
     }
 
     // Scroll: offset = lines scrolled up from bottom (0 = bottom)
@@ -120,22 +158,32 @@ impl AppState {
         let max = self.messages.len();
         if self.scroll_offset < max {
             self.scroll_offset += 1;
+            self.bump();
         }
     }
 
     pub fn scroll_down(&mut self) {
         if self.scroll_offset > 0 {
             self.scroll_offset -= 1;
+            self.bump();
         }
     }
 
     pub fn scroll_page_up(&mut self) {
         let max = self.messages.len();
-        self.scroll_offset = (self.scroll_offset + 10).min(max);
+        let next = (self.scroll_offset + 10).min(max);
+        if next != self.scroll_offset {
+            self.scroll_offset = next;
+            self.bump();
+        }
     }
 
     pub fn scroll_page_down(&mut self) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(10);
+        let next = self.scroll_offset.saturating_sub(10);
+        if next != self.scroll_offset {
+            self.scroll_offset = next;
+            self.bump();
+        }
     }
 
     pub fn toggle_history(&mut self) {
@@ -145,10 +193,12 @@ impl AppState {
         } else {
             self.status = "Vista chat".to_string();
         }
+        self.bump();
     }
 
     pub fn toggle_help(&mut self) {
         self.show_help = !self.show_help;
+        self.bump();
     }
 
     /// Handle an AppEvent from mpsc channel, updating state accordingly.
@@ -169,6 +219,7 @@ impl AppState {
                     .push(ChatLine::new(format!("tool:{name}"), truncated));
                 self.current_tool = Some(name.clone());
                 self.status = format!("Herramienta {name} completada");
+                self.bump();
             }
             AppEvent::AgentDone(result) => {
                 self.set_done(result);
@@ -178,6 +229,7 @@ impl AppState {
             }
             AppEvent::Quit => {
                 self.status = "Saliendo...".to_string();
+                self.bump();
             }
         }
     }

@@ -121,9 +121,12 @@ async fn run_tui(agent: Agent) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<tui::AppEvent>(32);
     let agent = std::sync::Arc::new(agent);
 
-    loop {
-        terminal.draw(|f| tui::ui::draw(f, &app))?;
+    // Event-driven render: draw once, then only after state actually changed
+    // (agent event or key). Idle 50ms ticks with no key do no draw at all.
+    terminal.draw(|f| tui::ui::draw(f, &app))?;
+    let mut last_drawn = app.version;
 
+    loop {
         tokio::select! {
             // Agent → UI events
             maybe_ev = rx.recv() => {
@@ -131,6 +134,10 @@ async fn run_tui(agent: Agent) -> Result<()> {
                     let is_quit = matches!(ev, tui::AppEvent::Quit);
                     app.handle_event(ev);
                     if is_quit { break; }
+                    if tui::ui::needs_redraw(last_drawn, &app) {
+                        terminal.draw(|f| tui::ui::draw(f, &app))?;
+                        last_drawn = app.version;
+                    }
                 }
             }
             // Poll crossterm events (non-blocking via tokio sleep)
@@ -154,18 +161,18 @@ async fn run_tui(agent: Agent) -> Result<()> {
                                         app.clear();
                                         // also clear session history
                                         app.session.messages.clear();
-                                        app.input.clear();
+                                        app.clear_input();
                                     },
                                     tui::ui::Command::History => {
                                         app.toggle_history();
-                                        app.input.clear();
+                                        app.clear_input();
                                     },
                                     tui::ui::Command::Help => {
                                         app.toggle_help();
-                                        app.input.clear();
+                                        app.clear_input();
                                     },
                                     tui::ui::Command::Tables => {
-                                        app.input.clear();
+                                        app.clear_input();
                                         let ag = agent.clone();
                                         let tx2 = tx.clone();
                                         tokio::spawn(async move {
@@ -176,7 +183,7 @@ async fn run_tui(agent: Agent) -> Result<()> {
                                         });
                                     },
                                     tui::ui::Command::Describe(tbl) => {
-                                        app.input.clear();
+                                        app.clear_input();
                                         let ag = agent.clone();
                                         let tx2 = tx.clone();
                                         let tbl2 = tbl.clone();
@@ -188,7 +195,7 @@ async fn run_tui(agent: Agent) -> Result<()> {
                                         });
                                     },
                                     tui::ui::Command::Refresh => {
-                                        app.input.clear();
+                                        app.clear_input();
                                         let ag = agent.clone();
                                         let tx2 = tx.clone();
                                         // need mutable session; we handle via agent method that clears cache
@@ -204,11 +211,11 @@ async fn run_tui(agent: Agent) -> Result<()> {
                                     },
                                     tui::ui::Command::Unknown(u) => {
                                         app.set_status(format!("Comando desconocido: {u} — /help"));
-                                        app.input.clear();
+                                        app.clear_input();
                                     },
                                     tui::ui::Command::Message(q) => {
                                         let q2 = q.clone();
-                                        app.input.clear();
+                                        app.clear_input();
                                         app.handle_event(tui::AppEvent::Input(q.clone()));
                                         // push to session for history continuity
                                         app.session.push(sql_agent::llm::Message::user(q.clone()));
@@ -225,15 +232,21 @@ async fn run_tui(agent: Agent) -> Result<()> {
                                     }
                                 }
                             },
-                            KeyCode::Backspace => { app.input.pop(); },
+                            KeyCode::Backspace => { app.pop_input(); },
                             KeyCode::Char(c) => {
                                 // Don't capture if it's a control combo already handled
-                                app.input.push(c);
+                                app.push_input(c);
                             },
                             _ => {}
                         }
+                        // Redraw only when the key actually mutated state.
+                        if app.version != last_drawn {
+                            terminal.draw(|f| tui::ui::draw(f, &app))?;
+                            last_drawn = app.version;
+                        }
                     }
                 }
+                // No key event: intentionally no draw (idle tick).
             }
         }
     }

@@ -82,6 +82,19 @@ impl SqlValidator {
         };
 
         let mut ctx = ValidationContext::default();
+        // Build the allowlist once per validation and share it with every
+        // scope check below. `None` means "no allowlist configured".
+        ctx.allowed = if self.policy.allowed_tables.is_empty() {
+            None
+        } else {
+            Some(
+                self.policy
+                    .allowed_tables
+                    .iter()
+                    .map(|s| normalize_table(s))
+                    .collect(),
+            )
+        };
         self.validate_query(query, &mut ctx)?;
 
         if ctx.joins > self.policy.max_joins {
@@ -106,13 +119,7 @@ impl SqlValidator {
             }
         }
 
-        if !self.policy.allowed_tables.is_empty() {
-            let allowed: HashSet<String> = self
-                .policy
-                .allowed_tables
-                .iter()
-                .map(|s| normalize_table(s))
-                .collect();
+        if let Some(allowed) = &ctx.allowed {
             for table in &ctx.tables {
                 if ctx.ctes.contains(&normalize_table(table)) {
                     continue;
@@ -289,19 +296,17 @@ impl SqlValidator {
                 SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. } => {}
             }
         }
-        if has_wildcard && !self.policy.allowed_tables.is_empty() {
-            let allowed: HashSet<String> = self
-                .policy
-                .allowed_tables
-                .iter()
-                .map(|s| normalize_table(s))
-                .collect();
-            for table in &scope.tables {
-                if ctx.ctes.contains(&normalize_table(table)) {
-                    continue;
-                }
-                if !allowed.contains(&normalize_table(table)) {
-                    bail!("Tabla no permitida: {table}");
+        if has_wildcard {
+            // Reuse the prebuilt allowlist from the validation context instead
+            // of rebuilding the HashSet per SELECT scope.
+            if let Some(allowed) = &ctx.allowed {
+                for table in &scope.tables {
+                    if ctx.ctes.contains(&normalize_table(table)) {
+                        continue;
+                    }
+                    if !allowed.contains(&normalize_table(table)) {
+                        bail!("Tabla no permitida: {table}");
+                    }
                 }
             }
         }
@@ -731,7 +736,15 @@ impl SqlValidator {
                 ctx.tables.insert(name.to_string());
             }
             TableFactor::Derived { subquery, .. } => {
+                // Early budget check: bail before recursing so deeply nested
+                // derived tables fail fast instead of only at the final catch.
                 ctx.subqueries += 1;
+                if ctx.subqueries > self.policy.max_subqueries {
+                    bail!(
+                        "Demasiadas subconsultas: máximo {}",
+                        self.policy.max_subqueries
+                    );
+                }
                 self.validate_query(subquery, ctx)?;
             }
             TableFactor::NestedJoin {
@@ -756,6 +769,9 @@ struct ValidationContext {
     ctes: HashSet<String>,
     joins: usize,
     subqueries: usize,
+    /// Allowlist built once in `validate` and shared with every scope check.
+    /// `None` means no allowlist is configured (all tables pass the gate).
+    allowed: Option<HashSet<String>>,
 }
 
 /// Alias-aware resolution of the tables visible to one SELECT scope.
@@ -1002,5 +1018,37 @@ mod tests {
         assert!(v()
             .validate("SELECT COUNT(*) FROM dbo.entradaLote")
             .is_ok());
+    }
+    #[test]
+    fn shared_allowlist_same_allow_block_for_scope_and_global() {
+        // The prebuilt allowlist must give identical verdicts through the
+        // per-scope wildcard gate and the global table gate.
+        assert!(v()
+            .validate("SELECT * FROM dbo.entradaLote")
+            .is_ok());
+        assert!(v()
+            .validate("SELECT e.* FROM dbo.entradaLote e")
+            .is_ok());
+        assert!(v()
+            .validate("SELECT * FROM dbo.usuarios_secretos")
+            .is_err());
+        assert!(v()
+            .validate("SELECT u.* FROM dbo.usuarios_secretos u")
+            .is_err());
+    }
+    #[test]
+    fn deep_derived_nesting_fails_fast_on_budget() {
+        // 10 nested derived tables with max_subqueries=5 must bail on budget
+        // (early Derived check), not slip through or recurse needlessly deep.
+        // Kept at 10 (not deeper) so the parser itself stays within stack.
+        let mut sql = "SELECT * FROM dbo.entradaLote".to_string();
+        for i in 0..10 {
+            sql = format!("SELECT * FROM ({sql}) AS d{i}");
+        }
+        let err = v().validate(&sql).unwrap_err().to_string();
+        assert!(
+            err.contains("subconsultas"),
+            "deep nesting must fail on subquery budget, got: {err}"
+        );
     }
 }
