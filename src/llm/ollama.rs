@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
+
+use super::{LlmProvider, Message, ToolDefinition};
 
 #[derive(Clone)]
 pub struct Ollama {
@@ -12,65 +13,6 @@ pub struct Ollama {
     model: String,
     timeout_seconds: u64,
     temperature: f32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Message {
-    pub role: String,
-    pub content: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tool_calls: Vec<ToolCall>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-}
-impl Message {
-    pub fn system(s: String) -> Self {
-        Self {
-            role: "system".into(),
-            content: s,
-            tool_calls: vec![],
-            name: None,
-        }
-    }
-    pub fn user(s: String) -> Self {
-        Self {
-            role: "user".into(),
-            content: s,
-            tool_calls: vec![],
-            name: None,
-        }
-    }
-    pub fn tool(name: &str, content: String) -> Self {
-        Self {
-            role: "tool".into(),
-            content,
-            tool_calls: vec![],
-            name: Some(name.into()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ToolCall {
-    pub function: ToolFunction,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ToolFunction {
-    pub name: String,
-    #[serde(default)]
-    pub arguments: Value,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ToolDefinition {
-    pub r#type: &'static str,
-    pub function: FunctionDefinition,
-}
-#[derive(Debug, Clone, Serialize)]
-pub struct FunctionDefinition {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub parameters: Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -113,7 +55,11 @@ impl Ollama {
             temperature,
         }
     }
-    pub async fn chat(
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for Ollama {
+    async fn chat(
         &self,
         messages: &[Message],
         tools: &[ToolDefinition],
@@ -145,7 +91,7 @@ impl Ollama {
         .context("Timeout HTTP de Ollama")??;
         let parsed: Response = response
             .error_for_status()
-            .context("Ollama devolvió HTTP error")?
+            .context("El proveedor LLM devolvió un error HTTP")?
             .json()
             .await
             .context("JSON inválido de Ollama")?;

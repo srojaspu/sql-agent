@@ -239,7 +239,9 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
 
     // Render terminal cursor at correct insertion point
     if chunks[1].width > 2 && chunks[1].height > 2 {
-        let char_count = app.input[..app.cursor_index.min(app.input.len())].chars().count() as u16;
+        let char_count = app.input[..app.cursor_index.min(app.input.len())]
+            .chars()
+            .count() as u16;
         let cursor_x = chunks[1].x + 1 + char_count.min(chunks[1].width.saturating_sub(3));
         let cursor_y = chunks[1].y + 1;
         frame.set_cursor_position((cursor_x, cursor_y));

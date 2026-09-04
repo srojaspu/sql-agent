@@ -17,14 +17,8 @@ impl PartialEq for AppEvent {
         match (self, other) {
             (AppEvent::Input(a), AppEvent::Input(b)) => a == b,
             (
-                AppEvent::AgentStep {
-                    step: s1,
-                    tool: t1,
-                },
-                AppEvent::AgentStep {
-                    step: s2,
-                    tool: t2,
-                },
+                AppEvent::AgentStep { step: s1, tool: t1 },
+                AppEvent::AgentStep { step: s2, tool: t2 },
             ) => s1 == s2 && t1 == t2,
             (
                 AppEvent::AgentTool {

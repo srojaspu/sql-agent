@@ -12,7 +12,7 @@ use crate::{
     config::Config,
     database::schema::{upsert_schema_memory, ColumnMatch, SchemaMemory, TableDetail},
     database::{ColumnInfo, SqlServer, TableInfo},
-    llm::{Message, Ollama, ToolCall},
+    llm::{default_provider, LlmProvider, Message, ToolCall},
     security::{SecurityPolicy, SqlValidator},
     util::split_table_name as shared_split_table,
 };
@@ -56,13 +56,17 @@ struct SchemaCache {
 pub struct Agent {
     config: Config,
     db: SqlServer,
-    llm: Ollama,
+    llm: Arc<dyn LlmProvider>,
     validator: SqlValidator,
     schema: Arc<RwLock<Option<SchemaCache>>>,
 }
 
 impl Agent {
     pub fn new(config: Config) -> Self {
+        Self::with_llm(config.clone(), default_provider(&config))
+    }
+
+    pub fn with_llm(config: Config, llm: Arc<dyn LlmProvider>) -> Self {
         let policy = SecurityPolicy {
             max_sql_length: config.max_sql_length,
             allowed_tables: config.allowed_tables.clone(),
@@ -76,14 +80,7 @@ impl Agent {
 
         Self {
             db: SqlServer::new(config.clone()),
-
-            llm: Ollama::new(
-                config.ollama_url.clone(),
-                config.ollama_model.clone(),
-                config.ollama_timeout_seconds,
-                config.ollama_temperature,
-                config.ollama_connect_timeout_seconds,
-            ),
+            llm,
 
             validator: SqlValidator::new(policy),
 
@@ -151,7 +148,7 @@ impl Agent {
                 .llm
                 .chat(&messages, &tool_defs, self.config.verbose)
                 .await
-                .with_context(|| format!("Ollama falló en STEP {step}"))?;
+                .with_context(|| format!("El proveedor LLM falló en STEP {step}"))?;
 
             /*
              * --------------------------------------------------------
@@ -186,9 +183,14 @@ impl Agent {
                         )
                         .await?;
 
+                    let tool_call_id = reply.tool_calls.first().and_then(|call| call.id.clone());
                     messages.push(reply);
 
-                    messages.push(Message::tool("execute_read_query", result));
+                    messages.push(Message::tool_with_call_id(
+                        "execute_read_query",
+                        result,
+                        tool_call_id,
+                    ));
 
                     tool_calls_history.push("execute_read_query".to_string());
 
@@ -269,7 +271,7 @@ impl Agent {
                     println!("{result}");
                 }
 
-                messages.push(Message::tool(name, result));
+                messages.push(Message::tool_with_call_id(name, result, call.id.clone()));
             }
         }
 
@@ -387,7 +389,7 @@ impl Agent {
                 .llm
                 .chat(&messages, &tool_defs, self.config.verbose)
                 .await
-                .with_context(|| format!("Ollama falló en STEP {step}"))?;
+                .with_context(|| format!("El proveedor LLM falló en STEP {step}"))?;
 
             if reply.tool_calls.is_empty() {
                 let text = reply.content.trim();
@@ -398,7 +400,11 @@ impl Agent {
                     let assistant_msg = reply.clone();
                     session.push(assistant_msg.clone());
                     messages.push(assistant_msg);
-                    let tool_msg = Message::tool("execute_read_query", result.clone());
+                    let tool_msg = Message::tool_with_call_id(
+                        "execute_read_query",
+                        result.clone(),
+                        reply.tool_calls.first().and_then(|call| call.id.clone()),
+                    );
                     session.push(tool_msg.clone());
                     messages.push(tool_msg);
                     tool_calls_history.push("execute_read_query".to_string());
@@ -452,7 +458,7 @@ impl Agent {
                     println!("📦 TOOL RESULT [{name}]:\n{result}");
                 }
                 tool_calls_history.push(name.to_string());
-                let tool_msg = Message::tool(name, result);
+                let tool_msg = Message::tool_with_call_id(name, result, call.id.clone());
                 session.push(tool_msg.clone());
                 messages.push(tool_msg);
             }
@@ -1967,6 +1973,10 @@ mod tests {
             database_user: "user".into(),
             database_password: "pass".into(),
             database_trust_cert: true,
+            llm_provider: "ollama".into(),
+            llm_model: String::new(),
+            llm_api_key: String::new(),
+            llm_base_url: String::new(),
             ollama_url: "http://127.0.0.1:11434".into(),
             ollama_model: "qwen3:4b".into(),
             ollama_timeout_seconds: 120,

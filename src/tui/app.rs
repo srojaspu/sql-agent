@@ -196,6 +196,7 @@ impl AppState {
                 content: r,
                 tool_calls: vec![],
                 name: None,
+                tool_call_id: None,
             });
         }
         self.status = "Completado".to_string();
@@ -658,6 +659,7 @@ mod tests {
             content: "respuesta previa".into(),
             tool_calls: vec![],
             name: None,
+            tool_call_id: None,
         });
         let sess_id = new_sess.id.clone();
         app.handle_event(AppEvent::SessionUpdate(Box::new(new_sess)));

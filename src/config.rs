@@ -11,6 +11,11 @@ pub struct Config {
     pub database_password: String,
     pub database_trust_cert: bool,
 
+    pub llm_provider: String,
+    pub llm_model: String,
+    pub llm_api_key: String,
+    pub llm_base_url: String,
+
     pub ollama_url: String,
     pub ollama_model: String,
     pub ollama_timeout_seconds: u64,
@@ -75,6 +80,11 @@ impl Config {
             database_user: get_required(map, "DATABASE_USER")?,
             database_password: get_required(map, "DATABASE_PASSWORD")?,
             database_trust_cert: parse_bool_map(map, "DATABASE_TRUST_CERT", false)?,
+
+            llm_provider: get_default_map(map, "LLM_PROVIDER", "ollama"),
+            llm_model: get_default_map(map, "LLM_MODEL", ""),
+            llm_api_key: get_default_map(map, "LLM_API_KEY", ""),
+            llm_base_url: get_default_map(map, "LLM_BASE_URL", ""),
 
             ollama_url: get_default_map(map, "OLLAMA_URL", "http://127.0.0.1:11434"),
             ollama_model: get_default_map(map, "OLLAMA_MODEL", "qwen3:4b"),
@@ -163,6 +173,10 @@ impl Config {
             "DATABASE_USER",
             "DATABASE_PASSWORD",
             "DATABASE_TRUST_CERT",
+            "LLM_PROVIDER",
+            "LLM_MODEL",
+            "LLM_API_KEY",
+            "LLM_BASE_URL",
             "OLLAMA_URL",
             "OLLAMA_MODEL",
             "OLLAMA_TIMEOUT_SECONDS",
@@ -195,6 +209,7 @@ impl Config {
         const PREFIXES: &[&str] = &[
             "DATABASE_",
             "OLLAMA_",
+            "LLM_",
             "MAX_",
             "ALLOWED_",
             "BLOCKED_",
@@ -207,6 +222,14 @@ impl Config {
         ];
         let known_set: std::collections::HashSet<&str> = KNOWN.iter().copied().collect();
         for key in map.keys() {
+            if matches!(
+                key.as_str(),
+                "OPENAI_API_KEY" | "GOOGLE_API_KEY" | "ANTHROPIC_API_KEY"
+            ) {
+                anyhow::bail!(
+                    "{key} ya no es compatible; use LLM_API_KEY con LLM_PROVIDER"
+                );
+            }
             if known_set.contains(key.as_str()) {
                 continue;
             }
@@ -322,6 +345,23 @@ mod tests {
             !cfg.database_trust_cert,
             "DATABASE_TRUST_CERT must default to false (explicit dev opt-in only)"
         );
+    }
+
+    #[test]
+    fn llm_provider_uses_generic_api_key() {
+        let mut m = minimal_map();
+        m.insert("LLM_PROVIDER".into(), "anthropic".into());
+        m.insert("LLM_API_KEY".into(), "generic-key".into());
+        let cfg = Config::from_map(&m).expect("provider config should parse");
+        assert_eq!(cfg.llm_api_key, "generic-key");
+    }
+
+    #[test]
+    fn provider_specific_api_keys_are_rejected() {
+        let mut m = minimal_map();
+        m.insert("LLM_PROVIDER".into(), "openai".into());
+        m.insert("OPENAI_API_KEY".into(), "provider-key".into());
+        assert!(Config::from_map(&m).is_err());
     }
 
     #[test]

@@ -47,7 +47,15 @@ async fn main() -> Result<()> {
         println!("\n╔════════════════════════════════════════════════════╗");
         println!("║             SQL AGENT PROFESSIONAL 0.7            ║");
         println!("╚════════════════════════════════════════════════════╝");
-        println!("⚙️  Modelo: {}", config.ollama_model);
+        println!(
+            "⚙️  Proveedor/modelo: {}/{}",
+            config.llm_provider,
+            if config.llm_model.is_empty() {
+                &config.ollama_model
+            } else {
+                &config.llm_model
+            }
+        );
         println!(
             "🗄️  SQL Server: {}:{}",
             config.database_host, config.database_port
