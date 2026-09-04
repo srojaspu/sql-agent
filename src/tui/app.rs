@@ -23,6 +23,7 @@ impl ChatLine {
 pub struct AppState {
     pub session: Session,
     pub input: String,
+    pub cursor_index: usize,
     pub messages: Vec<ChatLine>,
     /// Traza interna de herramientas — no se muestra en el chat, solo en status/debug.
     pub tool_trace: Vec<ChatLine>,
@@ -44,6 +45,7 @@ impl AppState {
         Self {
             session,
             input: String::new(),
+            cursor_index: 0,
             messages: Vec::new(),
             tool_trace: Vec::new(),
             scroll_offset: 0,
@@ -64,13 +66,6 @@ impl AppState {
     pub fn push_line(&mut self, role: impl Into<String>, content: impl Into<String>) {
         self.messages.push(ChatLine::new(role, content));
         self.bump();
-        // Auto-follow if at bottom; otherwise keep offset (user scrolled up)
-        if self.scroll_offset == 0 {
-            // stay at bottom — nothing to do
-        } else {
-            // keep scroll position stable relative to bottom: increase offset to stay at same historic position?
-            // For simplicity, leave offset unchanged — user must scroll down manually
-        }
     }
 
     pub fn push_user(&mut self, content: impl Into<String>) {
@@ -93,19 +88,77 @@ impl AppState {
     /// Version-bumping input helpers so the render loop can dirty-check
     /// keystrokes without polling the string every frame.
     pub fn push_input(&mut self, c: char) {
-        self.input.push(c);
+        if self.cursor_index >= self.input.len() {
+            self.input.push(c);
+            self.cursor_index = self.input.len();
+        } else {
+            self.input.insert(self.cursor_index, c);
+            self.cursor_index += c.len_utf8();
+        }
         self.bump();
     }
 
     pub fn pop_input(&mut self) {
-        if self.input.pop().is_some() {
+        if self.cursor_index > 0 && !self.input.is_empty() {
+            let prev = self.input[..self.cursor_index]
+                .char_indices()
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.input.remove(prev);
+            self.cursor_index = prev;
+            self.bump();
+        }
+    }
+
+    pub fn delete_input(&mut self) {
+        if self.cursor_index < self.input.len() {
+            self.input.remove(self.cursor_index);
+            self.bump();
+        }
+    }
+
+    pub fn move_cursor_left(&mut self) {
+        if self.cursor_index > 0 {
+            self.cursor_index = self.input[..self.cursor_index]
+                .char_indices()
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.bump();
+        }
+    }
+
+    pub fn move_cursor_right(&mut self) {
+        if self.cursor_index < self.input.len() {
+            let next = self.input[self.cursor_index..]
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| self.cursor_index + i)
+                .unwrap_or_else(|| self.input.len());
+            self.cursor_index = next;
+            self.bump();
+        }
+    }
+
+    pub fn move_cursor_home(&mut self) {
+        if self.cursor_index != 0 {
+            self.cursor_index = 0;
+            self.bump();
+        }
+    }
+
+    pub fn move_cursor_end(&mut self) {
+        if self.cursor_index != self.input.len() {
+            self.cursor_index = self.input.len();
             self.bump();
         }
     }
 
     pub fn clear_input(&mut self) {
-        if !self.input.is_empty() {
+        if !self.input.is_empty() || self.cursor_index != 0 {
             self.input.clear();
+            self.cursor_index = 0;
             self.bump();
         }
     }
@@ -113,6 +166,7 @@ impl AppState {
     pub fn clear(&mut self) {
         self.messages.clear();
         self.tool_trace.clear();
+        self.cursor_index = 0;
         self.scroll_offset = 0;
         self.status = "Historial limpiado".to_string();
         self.current_tool = None;
@@ -136,11 +190,18 @@ impl AppState {
     pub fn set_done(&mut self, result: impl Into<String>) {
         let r = result.into();
         self.push_assistant(r.clone());
+        if self.session.messages.last().map(|m| &m.content) != Some(&r) {
+            self.session.push(crate::llm::Message {
+                role: "assistant".into(),
+                content: r,
+                tool_calls: vec![],
+                name: None,
+            });
+        }
         self.status = "Completado".to_string();
         self.current_tool = None;
         self.is_loading = false;
         self.scroll_offset = 0; // follow bottom on done
-                                // push_assistant already bumped; status/is_loading changed too.
         self.bump();
     }
 
@@ -149,13 +210,21 @@ impl AppState {
         self.push_line("error", e.clone());
         self.status = format!("Error: {e}");
         self.is_loading = false;
-        // push_line already bumped; status changed too.
         self.bump();
+    }
+
+    pub fn scroll_limit(&self) -> usize {
+        let line_count: usize = self
+            .messages
+            .iter()
+            .map(|m| m.content.split('\n').count().max(1))
+            .sum();
+        line_count.max(self.messages.len())
     }
 
     // Scroll: offset = lines scrolled up from bottom (0 = bottom)
     pub fn scroll_up(&mut self) {
-        let max = self.messages.len();
+        let max = self.scroll_limit();
         if self.scroll_offset < max {
             self.scroll_offset += 1;
             self.bump();
@@ -170,7 +239,7 @@ impl AppState {
     }
 
     pub fn scroll_page_up(&mut self) {
-        let max = self.messages.len();
+        let max = self.scroll_limit();
         let next = (self.scroll_offset + 10).min(max);
         if next != self.scroll_offset {
             self.scroll_offset = next;
@@ -182,6 +251,13 @@ impl AppState {
         let next = self.scroll_offset.saturating_sub(10);
         if next != self.scroll_offset {
             self.scroll_offset = next;
+            self.bump();
+        }
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        if self.scroll_offset != 0 {
+            self.scroll_offset = 0;
             self.bump();
         }
     }
@@ -223,6 +299,10 @@ impl AppState {
             }
             AppEvent::AgentDone(result) => {
                 self.set_done(result);
+            }
+            AppEvent::SessionUpdate(sess) => {
+                self.session = *sess;
+                self.bump();
             }
             AppEvent::Error(e) => {
                 self.set_error(e);
@@ -526,5 +606,62 @@ mod tests {
         let ev2 = rx.recv().await.unwrap();
         app.handle_event(ev2);
         assert_eq!(app.status, "Saliendo...");
+    }
+
+    #[test]
+    fn app_input_cursor_navigation_and_editing() {
+        let mut app = make_state();
+        assert_eq!(app.cursor_index, 0);
+        app.push_input('a');
+        app.push_input('c');
+        assert_eq!(app.input, "ac");
+        assert_eq!(app.cursor_index, 2);
+
+        // Move left and insert 'b'
+        app.move_cursor_left();
+        assert_eq!(app.cursor_index, 1);
+        app.push_input('b');
+        assert_eq!(app.input, "abc");
+        assert_eq!(app.cursor_index, 2);
+
+        // Move home
+        app.move_cursor_home();
+        assert_eq!(app.cursor_index, 0);
+
+        // Delete at 0 deletes 'a'
+        app.delete_input();
+        assert_eq!(app.input, "bc");
+        assert_eq!(app.cursor_index, 0);
+
+        // Move end
+        app.move_cursor_end();
+        assert_eq!(app.cursor_index, 2);
+
+        // Backspace deletes 'c'
+        app.pop_input();
+        assert_eq!(app.input, "b");
+        assert_eq!(app.cursor_index, 1);
+
+        // Clear input
+        app.clear_input();
+        assert_eq!(app.input, "");
+        assert_eq!(app.cursor_index, 0);
+    }
+
+    #[test]
+    fn app_session_update_event_syncs_session() {
+        let mut app = make_state();
+        let mut new_sess = Session::new();
+        new_sess.push(crate::llm::Message::user("pregunta previa".into()));
+        new_sess.push(crate::llm::Message {
+            role: "assistant".into(),
+            content: "respuesta previa".into(),
+            tool_calls: vec![],
+            name: None,
+        });
+        let sess_id = new_sess.id.clone();
+        app.handle_event(AppEvent::SessionUpdate(Box::new(new_sess)));
+        assert_eq!(app.session.id, sess_id);
+        assert_eq!(app.session.messages.len(), 2);
     }
 }

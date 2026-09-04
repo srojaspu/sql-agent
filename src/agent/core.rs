@@ -792,9 +792,16 @@ impl Agent {
             println!("🔐 Validando SQL...");
         }
 
-        self.validator
-            .validate(sql)
-            .context("SQL bloqueado por política de seguridad")?;
+        if let Err(val_err) = self.validator.validate(sql) {
+            tracing::warn!("SQL validation blocked: {val_err}");
+            let out = format!(
+                "❌ Consulta bloqueada por política de seguridad: {val_err}\n\
+                 Ajusta tu consulta para cumplir la política (ej: solo lectura SELECT, sin comentarios, \
+                 máximo {} JOINs y únicamente tablas y columnas autorizadas).",
+                self.config.max_joins
+            );
+            return Ok(limit_text(&out, self.config.max_tool_result_chars));
+        }
 
         if self.config.verbose {
             println!("✅ SQL válido");
@@ -839,7 +846,14 @@ impl Agent {
                     );
                     return Ok(limit_text(&out, self.config.max_tool_result_chars));
                 } else {
-                    return Err(e);
+                    tracing::warn!("SQL execution error returned for self-correction: {msg}");
+                    let out = format!(
+                        "❌ Error de SQL Server: {msg}\n\
+                         Analiza el error. Si falló por nombre de columna inválido o cláusula GROUP BY, \
+                         verifica las columnas reales con describe_table o search_columns. \
+                         Corrige la consulta y ejecútala nuevamente."
+                    );
+                    return Ok(limit_text(&out, self.config.max_tool_result_chars));
                 }
             }
         };

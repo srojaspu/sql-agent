@@ -1,13 +1,51 @@
+use crate::agent::Session;
+
 /// TUI events — Agent→UI and UI internal
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum AppEvent {
     Input(String),
     AgentStep { step: usize, tool: String },
     AgentTool { name: String, content: String },
     AgentDone(String),
+    SessionUpdate(Box<Session>),
     Error(String),
     Quit,
 }
+
+impl PartialEq for AppEvent {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (AppEvent::Input(a), AppEvent::Input(b)) => a == b,
+            (
+                AppEvent::AgentStep {
+                    step: s1,
+                    tool: t1,
+                },
+                AppEvent::AgentStep {
+                    step: s2,
+                    tool: t2,
+                },
+            ) => s1 == s2 && t1 == t2,
+            (
+                AppEvent::AgentTool {
+                    name: n1,
+                    content: c1,
+                },
+                AppEvent::AgentTool {
+                    name: n2,
+                    content: c2,
+                },
+            ) => n1 == n2 && c1 == c2,
+            (AppEvent::AgentDone(a), AppEvent::AgentDone(b)) => a == b,
+            (AppEvent::SessionUpdate(a), AppEvent::SessionUpdate(b)) => a.id == b.id,
+            (AppEvent::Error(a), AppEvent::Error(b)) => a == b,
+            (AppEvent::Quit, AppEvent::Quit) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for AppEvent {}
 
 #[cfg(test)]
 mod tests {

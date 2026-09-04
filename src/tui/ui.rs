@@ -116,10 +116,9 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
         .split(area);
 
     // Chat pane
-    let chat_lines: Vec<Line> = if app.history_visible {
-        // History view: show session messages (borrowed, no per-frame clone
-        // or truncation; Paragraph wrapping handles long lines).
-        if app.session.messages.is_empty() {
+    let (chat_lines, chat_title) = if app.history_visible {
+        // History view: show session messages
+        let lines = if app.session.messages.is_empty() {
             vec![Line::from(Span::styled(
                 "Historial vacío",
                 Style::default().fg(Color::DarkGray),
@@ -141,25 +140,26 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
                     ])
                 })
                 .collect()
-        }
+        };
+        (lines, " Historial ".to_string())
     } else {
-        // Normal chat: visible slice respecting scroll_offset — only user/assistant/error.
-        // Tool trace lives in `app.tool_trace` and status pane, never interleaved in chat.
-        let height = chunks[0].height.saturating_sub(2) as usize; // borders
-        let visible = app.visible_messages(height.max(1));
-        let chat_visible: Vec<&crate::tui::app::ChatLine> = visible
+        // Normal chat: expand messages to styled Lines
+        let chat_messages: Vec<&crate::tui::app::ChatLine> = app
+            .messages
             .iter()
             .filter(|l| !l.role.starts_with("tool:"))
             .collect();
-        let has_any_chat = app.messages.iter().any(|m| !m.role.starts_with("tool:"));
-        if chat_visible.is_empty() && !has_any_chat {
-            vec![Line::from(Span::styled(
-                "Bienvenido — escribe tu pregunta y presiona Enter. /help para ayuda.",
-                Style::default().fg(Color::DarkGray),
-            ))]
+        if chat_messages.is_empty() {
+            (
+                vec![Line::from(Span::styled(
+                    "Bienvenido — escribe tu pregunta y presiona Enter. /help para ayuda.",
+                    Style::default().fg(Color::DarkGray),
+                ))],
+                " Chat ".to_string(),
+            )
         } else {
-            let mut expanded: Vec<Line> = Vec::new();
-            for l in chat_visible.iter() {
+            let mut all_lines: Vec<Line> = Vec::new();
+            for l in chat_messages {
                 let role_color = match l.role.as_str() {
                     "user" => Color::Cyan,
                     "assistant" => Color::Green,
@@ -169,10 +169,8 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
                 let content_lines = render_content_lines(&l.content);
                 for (idx, cl) in content_lines.into_iter().enumerate() {
                     if idx == 0 {
-                        // first line: role prefix + first content line
-                        // cl may be empty (content ""), handle gracefully
                         if cl.width() == 0 {
-                            expanded.push(Line::from(vec![Span::styled(
+                            all_lines.push(Line::from(vec![Span::styled(
                                 format!("{}: ", l.role),
                                 Style::default().fg(role_color),
                             )]));
@@ -182,30 +180,39 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
                                 Style::default().fg(role_color),
                             )];
                             spans.extend(cl.spans);
-                            expanded.push(Line::from(spans));
+                            all_lines.push(Line::from(spans));
                         }
                     } else if cl.width() == 0 {
-                        expanded.push(Line::from(String::new()));
+                        all_lines.push(Line::from(String::new()));
                     } else {
                         let mut spans = vec![Span::raw("  ")];
                         spans.extend(cl.spans);
-                        expanded.push(Line::from(spans));
+                        all_lines.push(Line::from(spans));
                     }
                 }
             }
-            // fallback if expanded empty (should not happen)
-            if expanded.is_empty() {
-                expanded.push(Line::from(Span::styled(
-                    "Bienvenido — escribe tu pregunta y presiona Enter. /help para ayuda.",
-                    Style::default().fg(Color::DarkGray),
-                )));
+
+            let viewport_height = chunks[0].height.saturating_sub(2) as usize;
+            let total_lines = all_lines.len();
+            if total_lines > viewport_height && viewport_height > 0 {
+                let max_scroll = total_lines.saturating_sub(viewport_height);
+                let scroll = app.scroll_offset.min(max_scroll);
+                let start = max_scroll.saturating_sub(scroll);
+                let end = (start + viewport_height).min(total_lines);
+                let title = if scroll > 0 {
+                    format!(" Chat [▲ Scroll: +{scroll} líneas] ")
+                } else {
+                    " Chat ".to_string()
+                };
+                (all_lines[start..end].to_vec(), title)
+            } else {
+                (all_lines, " Chat ".to_string())
             }
-            expanded
         }
     };
 
     let chat_block = Block::default()
-        .title(" Chat ")
+        .title(chat_title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Blue));
     let chat_para = Paragraph::new(chat_lines)
@@ -214,10 +221,10 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
         .style(Style::default().fg(Color::White));
     frame.render_widget(chat_para, chunks[0]);
 
-    // Input pane (borrows `app.input`; no per-frame clone).
+    // Input pane
     let input_text = if app.input.is_empty() {
         Line::from(Span::styled(
-            "Escribe aquí... (/help)",
+            "Escribe aquí... (/help para comandos)",
             Style::default().fg(Color::DarkGray),
         ))
     } else {
@@ -229,6 +236,14 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
         .border_style(Style::default().fg(Color::Green));
     let input_para = Paragraph::new(input_text).block(input_block);
     frame.render_widget(input_para, chunks[1]);
+
+    // Render terminal cursor at correct insertion point
+    if chunks[1].width > 2 && chunks[1].height > 2 {
+        let char_count = app.input[..app.cursor_index.min(app.input.len())].chars().count() as u16;
+        let cursor_x = chunks[1].x + 1 + char_count.min(chunks[1].width.saturating_sub(3));
+        let cursor_y = chunks[1].y + 1;
+        frame.set_cursor_position((cursor_x, cursor_y));
+    }
 
     // Status pane
     let status_color = if app.is_loading {
@@ -279,6 +294,12 @@ pub fn handle_key(key: crossterm::event::KeyEvent, app: &mut AppState) -> bool {
         (KeyCode::PageUp, _) => app.scroll_page_up(),
         (KeyCode::PageDown, _) => app.scroll_page_down(),
         (KeyCode::Char('h'), KeyModifiers::CONTROL) => app.toggle_help(),
+        (KeyCode::Left, _) => app.move_cursor_left(),
+        (KeyCode::Right, _) => app.move_cursor_right(),
+        (KeyCode::Home, _) | (KeyCode::Char('a'), KeyModifiers::CONTROL) => app.move_cursor_home(),
+        (KeyCode::End, _) | (KeyCode::Char('e'), KeyModifiers::CONTROL) => app.move_cursor_end(),
+        (KeyCode::Delete, _) => app.delete_input(),
+        (KeyCode::Char('u'), KeyModifiers::CONTROL) => app.clear_input(),
         _ => {}
     }
     false
@@ -513,5 +534,54 @@ mod tests {
             }
         }
         assert_eq!(renders, 2);
+    }
+
+    #[test]
+    fn handle_key_cursor_movement_and_editing() {
+        let mut app = make_app();
+        app.push_input('a');
+        app.push_input('b');
+        assert_eq!(app.cursor_index, 2);
+
+        // Left key
+        let left = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Left,
+            crossterm::event::KeyModifiers::empty(),
+        );
+        handle_key(left, &mut app);
+        assert_eq!(app.cursor_index, 1);
+
+        // Home key
+        let home = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Home,
+            crossterm::event::KeyModifiers::empty(),
+        );
+        handle_key(home, &mut app);
+        assert_eq!(app.cursor_index, 0);
+
+        // Right key
+        let right = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Right,
+            crossterm::event::KeyModifiers::empty(),
+        );
+        handle_key(right, &mut app);
+        assert_eq!(app.cursor_index, 1);
+
+        // End key
+        let end = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::End,
+            crossterm::event::KeyModifiers::empty(),
+        );
+        handle_key(end, &mut app);
+        assert_eq!(app.cursor_index, 2);
+
+        // Ctrl+U clears
+        let ctrl_u = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('u'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        handle_key(ctrl_u, &mut app);
+        assert_eq!(app.input, "");
+        assert_eq!(app.cursor_index, 0);
     }
 }

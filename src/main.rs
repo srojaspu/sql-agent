@@ -140,113 +140,153 @@ async fn run_tui(agent: Agent) -> Result<()> {
                     }
                 }
             }
-            // Poll crossterm events (non-blocking via tokio sleep)
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                if event::poll(Duration::from_millis(0))? {
-                    if let CEvent::Key(key) = event::read()? {
-                        if key.kind == KeyEventKind::Release {
-                            continue;
-                        }
-                        if tui::ui::handle_key(key, &mut app) {
-                            break;
-                        }
-                        match key.code {
-                            KeyCode::Enter => {
-                                let input = app.input.trim().to_string();
-                                if input.is_empty() { continue; }
-                                let cmd = tui::ui::parse_command(&input);
-                                match cmd {
-                                    tui::ui::Command::Quit => break,
-                                    tui::ui::Command::Clear => {
-                                        app.clear();
-                                        // also clear session history
-                                        app.session.messages.clear();
-                                        app.clear_input();
-                                    },
-                                    tui::ui::Command::History => {
-                                        app.toggle_history();
-                                        app.clear_input();
-                                    },
-                                    tui::ui::Command::Help => {
-                                        app.toggle_help();
-                                        app.clear_input();
-                                    },
-                                    tui::ui::Command::Tables => {
-                                        app.clear_input();
-                                        let ag = agent.clone();
-                                        let tx2 = tx.clone();
-                                        tokio::spawn(async move {
-                                            match ag.tui_list_tables().await {
-                                                Ok(txt) => { let _ = tx2.send(tui::AppEvent::AgentTool{name:"search_schema".into(), content: txt}).await; let _ = tx2.send(tui::AppEvent::AgentDone("Tablas listadas".into())).await; },
-                                                Err(e) => { let _ = tx2.send(tui::AppEvent::Error(e.to_string())).await; },
-                                            }
-                                        });
-                                    },
-                                    tui::ui::Command::Describe(tbl) => {
-                                        app.clear_input();
-                                        let ag = agent.clone();
-                                        let tx2 = tx.clone();
-                                        let tbl2 = tbl.clone();
-                                        tokio::spawn(async move {
-                                            match ag.tui_describe(&tbl2).await {
-                                                Ok(txt) => { let _ = tx2.send(tui::AppEvent::AgentTool{name:"describe_table".into(), content: txt}).await; let _ = tx2.send(tui::AppEvent::AgentDone(format!("Estructura de {tbl2}"))).await; },
-                                                Err(e) => { let _ = tx2.send(tui::AppEvent::Error(e.to_string())).await; },
-                                            }
-                                        });
-                                    },
-                                    tui::ui::Command::Refresh => {
-                                        app.clear_input();
-                                        let ag = agent.clone();
-                                        let tx2 = tx.clone();
-                                        // need mutable session; we handle via agent method that clears cache
-                                        // For now, emit step and then refresh
-                                        let _ = tx2.send(tui::AppEvent::AgentStep{step:1, tool:"refresh".into()}).await;
-                                        tokio::spawn(async move {
-                                            // refresh invalidates schema cache; session memory cleared via separate call
-                                            ag.refresh_cache().await;
-                                            let _ = tx2.send(tui::AppEvent::AgentDone("🔄 Esquema refrescado".into())).await;
-                                        });
-                                        app.session.schema_memory.clear();
-                                        app.set_status("Refrescando esquema...");
-                                    },
-                                    tui::ui::Command::Unknown(u) => {
-                                        app.set_status(format!("Comando desconocido: {u} — /help"));
-                                        app.clear_input();
-                                    },
-                                    tui::ui::Command::Message(q) => {
-                                        let q2 = q.clone();
-                                        app.clear_input();
-                                        app.handle_event(tui::AppEvent::Input(q.clone()));
-                                        // push to session for history continuity
-                                        app.session.push(sql_agent::llm::Message::user(q.clone()));
-                                        let ag = agent.clone();
-                                        let tx2 = tx.clone();
-                                        let mut sess_clone = app.session.clone();
-                                        tokio::spawn(async move {
-                                            let _ = tx2.send(tui::AppEvent::AgentStep{step:1, tool:"search_schema".into()}).await;
-                                            match ag.run_with_history(&mut sess_clone, &q2).await {
-                                                Ok(res) => { let _ = tx2.send(tui::AppEvent::AgentDone(res)).await; },
-                                                Err(e) => { let _ = tx2.send(tui::AppEvent::Error(e.to_string())).await; },
-                                            }
-                                        });
+            // Poll crossterm events (responsive 20ms tick with event queue draining)
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                let mut should_quit = false;
+                while event::poll(Duration::ZERO)? {
+                    match event::read()? {
+                        CEvent::Key(key) => {
+                            if key.kind == KeyEventKind::Release {
+                                continue;
+                            }
+                            if tui::ui::handle_key(key, &mut app) {
+                                should_quit = true;
+                                break;
+                            }
+                            match key.code {
+                                KeyCode::Enter => {
+                                    if app.is_loading {
+                                        app.set_status("⏳ Consulta en progreso, por favor espera...");
+                                        continue;
+                                    }
+                                    let input = app.input.trim().to_string();
+                                    if input.is_empty() { continue; }
+                                    let cmd = tui::ui::parse_command(&input);
+                                    match cmd {
+                                        tui::ui::Command::Quit => {
+                                            should_quit = true;
+                                            break;
+                                        }
+                                        tui::ui::Command::Clear => {
+                                            app.clear();
+                                            app.session.messages.clear();
+                                            app.clear_input();
+                                        }
+                                        tui::ui::Command::History => {
+                                            app.toggle_history();
+                                            app.clear_input();
+                                        }
+                                        tui::ui::Command::Help => {
+                                            app.toggle_help();
+                                            app.clear_input();
+                                        }
+                                        tui::ui::Command::Tables => {
+                                            app.clear_input();
+                                            app.is_loading = true;
+                                            app.set_status("Consultando tablas disponibles...");
+                                            let ag = agent.clone();
+                                            let tx2 = tx.clone();
+                                            tokio::spawn(async move {
+                                                match ag.tui_list_tables().await {
+                                                    Ok(txt) => {
+                                                        let _ = tx2.send(tui::AppEvent::AgentTool {
+                                                            name: "list_tables".into(),
+                                                            content: txt,
+                                                        }).await;
+                                                        let _ = tx2.send(tui::AppEvent::AgentDone("Tablas listadas".into())).await;
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = tx2.send(tui::AppEvent::Error(e.to_string())).await;
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        tui::ui::Command::Describe(tbl) => {
+                                            app.clear_input();
+                                            app.is_loading = true;
+                                            app.set_status(format!("Describiendo estructura de {tbl}..."));
+                                            let ag = agent.clone();
+                                            let tx2 = tx.clone();
+                                            let tbl2 = tbl.clone();
+                                            tokio::spawn(async move {
+                                                match ag.tui_describe(&tbl2).await {
+                                                    Ok(txt) => {
+                                                        let _ = tx2.send(tui::AppEvent::AgentTool {
+                                                            name: "describe_table".into(),
+                                                            content: txt,
+                                                        }).await;
+                                                        let _ = tx2.send(tui::AppEvent::AgentDone(format!("Estructura de {tbl2}"))).await;
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = tx2.send(tui::AppEvent::Error(e.to_string())).await;
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        tui::ui::Command::Refresh => {
+                                            app.clear_input();
+                                            app.is_loading = true;
+                                            app.set_status("Refrescando caché de esquema...");
+                                            let ag = agent.clone();
+                                            let tx2 = tx.clone();
+                                            tokio::spawn(async move {
+                                                ag.refresh_cache().await;
+                                                let _ = tx2.send(tui::AppEvent::AgentDone("🔄 Esquema refrescado".into())).await;
+                                            });
+                                            app.session.schema_memory.clear();
+                                        }
+                                        tui::ui::Command::Unknown(u) => {
+                                            app.set_status(format!("Comando desconocido: {u} — escribe /help"));
+                                            app.clear_input();
+                                        }
+                                        tui::ui::Command::Message(q) => {
+                                            let q2 = q.clone();
+                                            app.clear_input();
+                                            app.handle_event(tui::AppEvent::Input(q.clone()));
+                                            app.session.push(sql_agent::llm::Message::user(q.clone()));
+                                            let ag = agent.clone();
+                                            let tx2 = tx.clone();
+                                            let mut sess_clone = app.session.clone();
+                                            tokio::spawn(async move {
+                                                let _ = tx2.send(tui::AppEvent::AgentStep { step: 1, tool: "search_schema".into() }).await;
+                                                match ag.run_with_history(&mut sess_clone, &q2).await {
+                                                    Ok(res) => {
+                                                        let _ = tx2.send(tui::AppEvent::SessionUpdate(Box::new(sess_clone))).await;
+                                                        let _ = tx2.send(tui::AppEvent::AgentDone(res)).await;
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = tx2.send(tui::AppEvent::Error(e.to_string())).await;
+                                                    }
+                                                }
+                                            });
+                                        }
                                     }
                                 }
-                            },
-                            KeyCode::Backspace => { app.pop_input(); },
-                            KeyCode::Char(c) => {
-                                // Don't capture if it's a control combo already handled
-                                app.push_input(c);
-                            },
-                            _ => {}
+                                KeyCode::Backspace => {
+                                    app.pop_input();
+                                }
+                                KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == crossterm::event::KeyModifiers::SHIFT => {
+                                    app.push_input(c);
+                                }
+                                _ => {}
+                            }
                         }
-                        // Redraw only when the key actually mutated state.
-                        if app.version != last_drawn {
+                        CEvent::Resize(_, _) => {
+                            terminal.autoresize()?;
+                            terminal.clear()?;
                             terminal.draw(|f| tui::ui::draw(f, &app))?;
                             last_drawn = app.version;
                         }
+                        _ => {}
                     }
                 }
-                // No key event: intentionally no draw (idle tick).
+                if should_quit {
+                    break;
+                }
+                if app.version != last_drawn {
+                    terminal.draw(|f| tui::ui::draw(f, &app))?;
+                    last_drawn = app.version;
+                }
             }
         }
     }

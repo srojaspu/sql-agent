@@ -126,23 +126,31 @@ impl Config {
             }
         }
         if let Some(v) = map.get("BLOCKED_TABLES") {
-            tracing::warn!("BLOCKED_TABLES is deprecated, use ALLOWED_TABLES instead");
-            return v.clone();
+            if !v.trim().is_empty() {
+                tracing::warn!("BLOCKED_TABLES is deprecated, use ALLOWED_TABLES instead");
+                return v.clone();
+            }
         }
         if let Some(v) = map.get("BLOCKED_COLUMNS") {
-            tracing::warn!("BLOCKED_COLUMNS is deprecated, use ALLOWED_TABLES instead");
-            return v.clone();
+            if !v.trim().is_empty() {
+                tracing::warn!("BLOCKED_COLUMNS is deprecated, use ALLOWED_TABLES instead");
+                return v.clone();
+            }
         }
         String::new()
     }
 
     fn resolve_max_steps_raw(map: &std::collections::HashMap<String, String>) -> Option<String> {
         if let Some(v) = map.get("MAX_STEPS") {
-            return Some(v.clone());
+            if !v.trim().is_empty() {
+                return Some(v.clone());
+            }
         }
         if let Some(v) = map.get("MAX_AGENT_STEPS") {
-            tracing::warn!("MAX_AGENT_STEPS is deprecated, use MAX_STEPS instead");
-            return Some(v.clone());
+            if !v.trim().is_empty() {
+                tracing::warn!("MAX_AGENT_STEPS is deprecated, use MAX_STEPS instead");
+                return Some(v.clone());
+            }
         }
         None
     }
