@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::time::Instant;
 
-use super::{http, LlmProvider, Message, ToolCall, ToolDefinition, ToolFunction};
+use super::{client, LlmProvider, Message, ToolCall, ToolDefinition, ToolFunction};
 use crate::config::Config;
 
 #[derive(Clone)]
@@ -16,13 +16,16 @@ pub struct Google {
 }
 
 impl Google {
-    pub fn new(config: &Config) -> Self {
+    /// Build over the shared client from [`client::build_client`].
+    ///
+    /// Infallible by construction: the client arrives already built, so
+    /// this constructor cannot panic.
+    pub fn new(config: &Config, client: reqwest::Client) -> Self {
         Self {
-            client: http::client(config.llm.connect_timeout_s)
-                .expect("No se pudo crear HTTP client"),
-            base_url: http::base_url(config, "https://generativelanguage.googleapis.com/v1beta"),
+            client,
+            base_url: client::base_url(config, "https://generativelanguage.googleapis.com/v1beta"),
             api_key: config.llm.api_key.clone(),
-            model: http::model(config, "gemini-2.0-flash"),
+            model: client::model(config, "gemini-2.0-flash"),
             timeout_seconds: config.llm.timeout_s,
             temperature: config.llm.temperature,
         }
@@ -51,7 +54,7 @@ impl LlmProvider for Google {
             "generationConfig": {"temperature": self.temperature}
         });
         let started = Instant::now();
-        let value = http::send_json(
+        let value = client::send_json(
             self.client
                 .post(format!(
                     "{}/models/{}:generateContent",

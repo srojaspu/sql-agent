@@ -1,116 +1,38 @@
 mod anthropic;
+mod client;
 mod google;
-mod http;
+mod messages;
 mod ollama;
 mod openai;
+mod provider;
 
-use anyhow::Result;
-use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::sync::Arc;
+use std::time::Duration;
+
+use reqwest::Client;
 
 use crate::config::Config;
+pub use client::build_client;
+pub use messages::{FunctionDefinition, Message, ToolCall, ToolDefinition, ToolFunction};
 pub use ollama::Ollama;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Message {
-    pub role: String,
-    pub content: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tool_calls: Vec<ToolCall>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
-}
-
-impl Message {
-    pub fn system(content: String) -> Self {
-        Self {
-            role: "system".into(),
-            content,
-            tool_calls: vec![],
-            name: None,
-            tool_call_id: None,
-        }
-    }
-
-    pub fn user(content: String) -> Self {
-        Self {
-            role: "user".into(),
-            content,
-            tool_calls: vec![],
-            name: None,
-            tool_call_id: None,
-        }
-    }
-
-    pub fn tool(name: &str, content: String) -> Self {
-        Self {
-            role: "tool".into(),
-            content,
-            tool_calls: vec![],
-            name: Some(name.into()),
-            tool_call_id: None,
-        }
-    }
-
-    pub fn tool_with_call_id(name: &str, content: String, tool_call_id: Option<String>) -> Self {
-        let mut message = Self::tool(name, content);
-        message.tool_call_id = tool_call_id;
-        message
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ToolCall {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    pub function: ToolFunction,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ToolFunction {
-    pub name: String,
-    #[serde(default)]
-    pub arguments: Value,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ToolDefinition {
-    pub r#type: &'static str,
-    pub function: FunctionDefinition,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct FunctionDefinition {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub parameters: Value,
-}
-
-#[async_trait]
-pub trait LlmProvider: Send + Sync {
-    async fn chat(
-        &self,
-        messages: &[Message],
-        tools: &[ToolDefinition],
-        verbose: bool,
-    ) -> Result<Message>;
-}
+pub use provider::LlmProvider;
 
 pub fn default_provider(config: &Config) -> Arc<dyn LlmProvider> {
+    // One shared client for whichever provider is selected. `build_client`
+    // only fails on TLS-backend init, so fall back to a default client
+    // rather than panic (no `.expect` under `llm`).
+    let client = build_client(Duration::from_secs(config.llm.connect_timeout_s.max(1)))
+        .unwrap_or_else(|_| Client::new());
     match config.llm.provider.to_ascii_lowercase().as_str() {
-        "openai" | "openai-compatible" => Arc::new(openai::OpenAi::new(config)),
-        "google" | "gemini" => Arc::new(google::Google::new(config)),
-        "anthropic" | "claude" => Arc::new(anthropic::Anthropic::new(config)),
+        "openai" | "openai-compatible" => Arc::new(openai::OpenAi::new(config, client)),
+        "google" | "gemini" => Arc::new(google::Google::new(config, client)),
+        "anthropic" | "claude" => Arc::new(anthropic::Anthropic::new(config, client)),
         _ => Arc::new(Ollama::new(
             config.llm.ollama_url.clone(),
             config.llm.ollama_model.clone(),
             config.llm.timeout_s,
             config.llm.temperature,
-            config.llm.connect_timeout_s,
+            client,
         )),
     }
 }
