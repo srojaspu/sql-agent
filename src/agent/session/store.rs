@@ -50,58 +50,62 @@ impl Session {
     }
 
     fn enforce_caps(&mut self) {
-        // Cap message count: remove oldest tool results first
+        // Cap message count: remove complete tool-turns atomically first.
+        // A "tool turn" = one assistant message with tool_calls + all immediately
+        // following tool messages that are its results. Removing partial turns
+        // would leave an assistant message with unresolved tool_calls, causing
+        // HTTP 400 errors in providers like Anthropic and Gemini.
         while self.messages.len() > MAX_MESSAGES {
-            if let Some(pos) = self
-                .messages
-                .iter()
-                .position(|m: &Message| m.role == "tool")
-            {
-                self.messages.remove(pos);
-            } else {
-                self.messages.remove(0);
+            if !self.remove_oldest_tool_turn() {
+                // No complete tool turn found; fall back to removing oldest tool message
+                // (to preserve user/assistant conversation flow), then oldest non-tool.
+                if let Some(pos) = self
+                    .messages
+                    .iter()
+                    .position(|m: &Message| m.role == "tool")
+                {
+                    self.messages.remove(pos);
+                } else if self.messages.len() > 1 {
+                    self.messages.remove(0);
+                } else {
+                    break;
+                }
             }
         }
-        // Cap total chars: truncate oldest tool results first
+        // Cap total chars: same atomic-turn strategy first.
+        // If no complete tool turn exists, remove oldest tool message (not truncate).
+        // If no tool messages exist, truncate the single huge message.
         while self.total_chars() > MAX_CHARS {
-            if let Some(pos) = self
-                .messages
-                .iter()
-                .position(|m: &Message| m.role == "tool")
-            {
-                let len = self.messages[pos].content.len();
-                if len > 500 {
-                    let truncated: String = self.messages[pos]
-                        .content
-                        .chars()
-                        .take(500)
-                        .collect::<String>()
-                        + "...[truncated for caps]";
-                    self.messages[pos].content = truncated;
-                    if self.total_chars() <= MAX_CHARS {
-                        break;
-                    } else {
-                        self.messages.remove(pos);
-                        continue;
-                    }
-                } else {
+            if !self.remove_oldest_tool_turn() {
+                // No complete tool turn exists. Try to remove oldest tool message.
+                if let Some(pos) = self
+                    .messages
+                    .iter()
+                    .position(|m: &Message| m.role == "tool")
+                {
                     self.messages.remove(pos);
+                    continue;
                 }
-            } else {
-                // No tool messages left, remove oldest non-tool
-                if self.messages.len() > 1 {
-                    self.messages.remove(0);
-                } else if !self.messages.is_empty() {
-                    // Single huge message: truncate it
-                    let truncated: String = self.messages[0]
-                        .content
-                        .chars()
-                        .take(MAX_CHARS)
-                        .collect::<String>()
-                        + "...[truncated]";
-                    self.messages[0].content = truncated;
-                    break;
-                } else {
+                // No tool messages at all - truncate the largest message if it's huge,
+                // otherwise remove oldest non-system message.
+                if self.messages.len() == 1 {
+                    let msg = &mut self.messages[0];
+                    if msg.content.len() > MAX_CHARS {
+                        msg.content.truncate(MAX_CHARS);
+                        msg.content.push_str("...[truncated]");
+                        break;
+                    }
+                }
+                // Multiple messages but no tools - remove oldest non-system
+                let mut removed = false;
+                for i in 0..self.messages.len() {
+                    if self.messages[i].role != "system" {
+                        self.messages.remove(i);
+                        removed = true;
+                        break;
+                    }
+                }
+                if !removed {
                     break;
                 }
             }
@@ -111,6 +115,30 @@ impl Session {
         }
         // Summarization fallback: if still over and we have many messages, keep last half
         // For now, aggressive truncation already handles it; this is placeholder for future summary
+    }
+
+    /// Remove the oldest complete tool turn atomically:
+    /// one `assistant` message with non-empty `tool_calls` plus all immediately
+    /// following `tool` messages (which are its results).
+    ///
+    /// Returns `true` if a turn was removed, `false` if none found.
+    fn remove_oldest_tool_turn(&mut self) -> bool {
+        // Find the first assistant message that has tool_calls.
+        let Some(assistant_pos) = self
+            .messages
+            .iter()
+            .position(|m| m.role == "assistant" && !m.tool_calls.is_empty())
+        else {
+            return false;
+        };
+        // Collect all consecutive `tool` messages that follow it.
+        let mut end = assistant_pos + 1;
+        while end < self.messages.len() && self.messages[end].role == "tool" {
+            end += 1;
+        }
+        // Drain the assistant + all its tool results together.
+        self.messages.drain(assistant_pos..end);
+        true
     }
 
     pub fn history_path() -> PathBuf {
@@ -225,7 +253,100 @@ impl Default for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::Message;
+    use crate::llm::{Message, ToolCall, ToolFunction};
+
+    /// One assistant-with-`tool_calls` plus its tool result (a whole turn).
+    fn tool_turn(call_id: &str, tool_name: &str, result: &str) -> Vec<Message> {
+        let mut assistant = Message::assistant("working".to_string());
+        assistant.tool_calls = vec![ToolCall {
+            id: Some(call_id.to_string()),
+            function: ToolFunction {
+                name: tool_name.to_string(),
+                arguments: serde_json::json!({}),
+            },
+        }];
+        vec![
+            assistant,
+            Message::tool_with_call_id(tool_name, result.to_string(), Some(call_id.to_string())),
+        ]
+    }
+
+    /// Invariant: every assistant `tool_call` id keeps a matching tool result.
+    fn assert_tool_calls_paired(s: &Session) {
+        for m in &s.messages {
+            for call in &m.tool_calls {
+                let id = call.id.clone().unwrap_or_else(|| call.function.name.clone());
+                assert!(
+                    s.messages.iter().any(|r| r.role == "tool"
+                        && r.tool_call_id.as_deref() == Some(id.as_str())),
+                    "orphan tool_call {id}: no tool result follows"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn remove_oldest_tool_turn_drains_oldest_whole_turn() {
+        let mut s = Session::new();
+        s.messages.push(Message::user("q".to_string()));
+        s.messages.extend(tool_turn("c1", "search_schema", "result one"));
+        s.messages.extend(tool_turn("c2", "search_schema", "result two"));
+
+        assert!(s.remove_oldest_tool_turn(), "oldest turn must drain");
+        assert_eq!(s.messages.len(), 3, "assistant + tool of c1 removed together");
+        assert!(
+            !s.messages.iter().any(|m| m.content == "result one"),
+            "oldest result must be gone"
+        );
+        assert!(
+            s.messages.iter().any(|m| m.content == "result two"),
+            "newest turn must survive"
+        );
+        assert_tool_calls_paired(&s);
+    }
+
+    #[test]
+    fn remove_oldest_tool_turn_empty_is_noop() {
+        let mut s = Session::new();
+        assert!(!s.remove_oldest_tool_turn(), "empty history drains nothing");
+        assert!(s.messages.is_empty(), "history stays empty");
+    }
+
+    #[test]
+    fn remove_oldest_tool_turn_without_turns_returns_false() {
+        let mut s = Session::new();
+        s.messages.push(Message::user("hello".to_string()));
+        s.messages.push(Message::tool("search_schema", "rows".to_string()));
+        assert!(
+            !s.remove_oldest_tool_turn(),
+            "no assistant[tool_calls] means no whole turn"
+        );
+        assert_eq!(s.messages.len(), 2, "history untouched");
+    }
+
+    #[test]
+    fn enforce_caps_evicts_whole_turns_preserving_pairing() {
+        let mut s = Session::new();
+        for i in 0..20 {
+            s.messages.extend(tool_turn(
+                &format!("c{i}"),
+                "search_schema",
+                &format!("result {i}"),
+            ));
+        }
+        assert_eq!(s.messages.len(), 40);
+        s.push(Message::user("latest question".to_string()));
+        assert!(s.messages.len() <= MAX_MESSAGES, "cap enforced");
+        assert!(
+            !s.messages.iter().any(|m| m.content == "result 0"),
+            "oldest whole turn evicted first"
+        );
+        assert!(
+            s.messages.iter().any(|m| m.content == "latest question"),
+            "newest message retained"
+        );
+        assert_tool_calls_paired(&s);
+    }
 
     #[test]
     fn session_new_has_uuid_and_timestamps() {
