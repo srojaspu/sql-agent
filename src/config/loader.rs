@@ -62,6 +62,8 @@ impl AppConfig {
                 temperature: get_default_map(map, "OLLAMA_TEMPERATURE", "0.0")
                     .parse()
                     .context("OLLAMA_TEMPERATURE inválido")?,
+                // S1 default only: S2 wires the `LLM_MAX_RETRIES` env knob.
+                max_retries: 3,
             },
             policy: PolicyConfig {
                 allowed_tables,

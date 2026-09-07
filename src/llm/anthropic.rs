@@ -13,6 +13,7 @@ pub struct Anthropic {
     model: String,
     timeout_seconds: u64,
     temperature: f32,
+    max_retries: u8,
 }
 
 impl Anthropic {
@@ -28,6 +29,7 @@ impl Anthropic {
             model: client::model(config, "claude-3-5-haiku-latest"),
             timeout_seconds: config.llm.timeout_s,
             temperature: config.llm.temperature,
+            max_retries: config.llm.max_retries,
         }
     }
 }
@@ -56,14 +58,17 @@ impl LlmProvider for Anthropic {
             "temperature": self.temperature,
         });
         let started = Instant::now();
-        let value = client::send_json(
-            self.client
-                .post(format!("{}/messages", self.base_url))
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", "2023-06-01")
-                .json(&body),
+        let value = client::send_json_retry(
+            || {
+                self.client
+                    .post(format!("{}/messages", self.base_url))
+                    .header("x-api-key", &self.api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .json(&body)
+            },
             self.timeout_seconds,
             "Anthropic",
+            self.max_retries,
         )
         .await?;
         let blocks = value

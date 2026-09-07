@@ -40,6 +40,16 @@ impl Message {
         }
     }
 
+    pub fn assistant(content: String) -> Self {
+        Self {
+            role: "assistant".into(),
+            content,
+            tool_calls: vec![],
+            name: None,
+            tool_call_id: None,
+        }
+    }
+
     pub fn tool(name: &str, content: String) -> Self {
         Self {
             role: "tool".into(),

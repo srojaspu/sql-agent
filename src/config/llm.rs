@@ -60,4 +60,10 @@ pub struct LlmConfig {
     /// Env: `OLLAMA_TEMPERATURE` (default `"0.0"`, parse error message
     /// `"OLLAMA_TEMPERATURE inválido"` preserved by the loader).
     pub temperature: f32,
+
+    /// Maximum LLM retry attempts for transient failures (429/5xx/timeout).
+    ///
+    /// Env: `LLM_MAX_RETRIES` (default `3`; S1 default only — S2 wires the
+    /// env knob. `0` means a single attempt with no retry).
+    pub max_retries: u8,
 }

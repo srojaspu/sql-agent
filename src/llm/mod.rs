@@ -33,6 +33,7 @@ pub fn default_provider(config: &Config) -> Arc<dyn LlmProvider> {
             config.llm.timeout_s,
             config.llm.temperature,
             client,
+            config.llm.max_retries,
         )),
     }
 }

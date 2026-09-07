@@ -80,6 +80,7 @@ mod tests {
                 timeout_s: 120,
                 connect_timeout_s: 5,
                 temperature: 0.0,
+                max_retries: 3,
             },
             policy: PolicyConfig {
                 allowed_tables: vec![],

@@ -13,6 +13,7 @@ pub struct OpenAi {
     model: String,
     timeout_seconds: u64,
     temperature: f32,
+    max_retries: u8,
 }
 
 impl OpenAi {
@@ -28,6 +29,7 @@ impl OpenAi {
             model: client::model(config, "gpt-4o-mini"),
             timeout_seconds: config.llm.timeout_s,
             temperature: config.llm.temperature,
+            max_retries: config.llm.max_retries,
         }
     }
 }
@@ -50,13 +52,16 @@ impl LlmProvider for OpenAi {
             "temperature": self.temperature,
         });
         let started = Instant::now();
-        let value = client::send_json(
-            self.client
-                .post(format!("{}/chat/completions", self.base_url))
-                .bearer_auth(&self.api_key)
-                .json(&body),
+        let value = client::send_json_retry(
+            || {
+                self.client
+                    .post(format!("{}/chat/completions", self.base_url))
+                    .bearer_auth(&self.api_key)
+                    .json(&body)
+            },
             self.timeout_seconds,
             "OpenAI",
+            self.max_retries,
         )
         .await?;
         let message = value

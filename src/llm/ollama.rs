@@ -1,10 +1,9 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
-use tokio::time::timeout;
+use std::time::Instant;
 
-use super::{LlmProvider, Message, ToolDefinition};
+use super::{client, LlmProvider, Message, ToolDefinition};
 
 #[derive(Clone)]
 pub struct Ollama {
@@ -13,6 +12,7 @@ pub struct Ollama {
     model: String,
     timeout_seconds: u64,
     temperature: f32,
+    max_retries: u8,
 }
 
 #[derive(Debug, Serialize)]
@@ -46,6 +46,7 @@ impl Ollama {
         timeout_seconds: u64,
         temperature: f32,
         client: Client,
+        max_retries: u8,
     ) -> Self {
         Self {
             client,
@@ -53,6 +54,7 @@ impl Ollama {
             model,
             timeout_seconds,
             temperature,
+            max_retries,
         }
     }
 }
@@ -80,20 +82,18 @@ impl LlmProvider for Ollama {
             println!("🧠 LLM → {} | esperando respuesta/tool...", self.model);
         }
         let started = Instant::now();
-        let response = timeout(
-            Duration::from_secs(self.timeout_seconds),
-            self.client
-                .post(format!("{}/api/chat", self.base_url))
-                .json(&req)
-                .send(),
+        let parsed = client::send_json_retry(
+            || {
+                self.client
+                    .post(format!("{}/api/chat", self.base_url))
+                    .json(&req)
+            },
+            self.timeout_seconds,
+            "Ollama",
+            self.max_retries,
         )
-        .await
-        .context("Timeout HTTP de Ollama")??;
-        let parsed: Response = response
-            .error_for_status()
-            .context("El proveedor LLM devolvió un error HTTP")?
-            .json()
-            .await
+        .await?;
+        let parsed: Response = serde_json::from_value(parsed)
             .context("JSON inválido de Ollama")?;
         if !parsed.done {
             anyhow::bail!("Ollama no finalizó la respuesta");

@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use reqwest::{Client, RequestBuilder};
 use serde_json::Value;
 use std::time::Duration;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 use crate::error::LlmError;
 
@@ -63,6 +63,107 @@ pub async fn send_json(
         anyhow::bail!("{provider} devolvió HTTP {status}");
     }
     serde_json::from_str(&body).with_context(|| format!("JSON inválido de {provider}"))
+}
+
+/// Retryable-status predicate shared by the backoff loop: only 429 and
+/// 5xx are transient. Every other 4xx (and 2xx) fails fast without retry;
+/// network/timeout errors retry in [`send_json_retry`] without a status.
+pub(crate) fn is_retryable_status(status: u16) -> bool {
+    status == 429 || (500..600).contains(&status)
+}
+
+/// POST a JSON body with bounded retry on 429 / 5xx / network-timeout
+/// using exponential backoff (800ms → 1.6s → 3.2s).
+///
+/// `make_request` re-constructs a fresh [`RequestBuilder`] per attempt —
+/// mandatory because `RequestBuilder` is not `Clone`.
+///
+/// Stops after `max_retries + 1` attempts and returns the last error;
+/// `max_retries = 0` means a single attempt with no retry.
+pub async fn send_json_retry<F>(
+    make_request: F,
+    timeout_seconds: u64,
+    provider: &str,
+    max_retries: u8,
+) -> Result<Value>
+where
+    F: Fn() -> RequestBuilder,
+{
+    // Fast path: zero retries means a single attempt through the shared
+    // single-shot helper, keeping `send_json` as the canonical no-retry path.
+    if max_retries == 0 {
+        return send_json(make_request(), timeout_seconds, provider).await;
+    }
+    let mut delay = Duration::from_millis(800);
+    let mut last_error = String::new();
+
+    for attempt in 0..=max_retries {
+        let request = make_request();
+        let response = match timeout(Duration::from_secs(timeout_seconds.max(1)), request.send())
+            .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                last_error = format!("{provider} error de red: {e}");
+                if attempt == max_retries {
+                    anyhow::bail!("{last_error}");
+                }
+                tracing::warn!("Reintento {}/{} para {provider}: {e}", attempt + 1, max_retries);
+                sleep(delay).await;
+                delay *= 2;
+                continue;
+            }
+            Err(_) => {
+                last_error = format!("Timeout HTTP de {provider}");
+                if attempt == max_retries {
+                    anyhow::bail!("{last_error}");
+                }
+                tracing::debug!(
+                    "Timeout reintento {}/{} para {provider}",
+                    attempt + 1,
+                    max_retries
+                );
+                sleep(delay).await;
+                delay *= 2;
+                continue;
+            }
+        };
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .context("No se pudo leer la respuesta del proveedor LLM")?;
+
+        if is_retryable_status(status.as_u16()) {
+            last_error = format!("{provider} HTTP {status}: {}", &body[..body.len().min(200)]);
+            if attempt < max_retries {
+                tracing::debug!(
+                    "Reintento {}/{} después de HTTP {} de {provider}: {}",
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    &body[..body.len().min(100)]
+                );
+                sleep(delay).await;
+                delay *= 2;
+                continue;
+            }
+            anyhow::bail!("Máximo de reintentos alcanzado. Último error: {last_error}");
+        }
+
+        if !status.is_success() {
+            anyhow::bail!(
+                "{provider} devolvió HTTP {status}: {}",
+                &body[..body.len().min(500)]
+            );
+        }
+
+        return serde_json::from_str(&body)
+            .with_context(|| format!("JSON inválido de {provider}"));
+    }
+
+    anyhow::bail!("Máximo de reintentos alcanzado. Último error: {last_error}");
 }
 
 /// Resolve the model id: `LLM_MODEL` wins, otherwise the provider default.
@@ -151,5 +252,163 @@ mod tests {
                 "status {status} should fail fast"
             );
         }
+    }
+
+    /// Minimal stub HTTP origin for retry tests: serves the queued
+    /// `(status, body)` pairs in order (repeating the last one once the
+    /// queue drains) and counts every hit.
+    async fn spawn_stub(
+        queue: Vec<(u16, String)>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("stub listener binds");
+        let addr = listener.local_addr().expect("stub addr");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let queue = Arc::new(Mutex::new(queue));
+        let hits_clone = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let hits = hits_clone.clone();
+                let queue = queue.clone();
+                tokio::spawn(async move {
+                    let mut socket = socket;
+                    let mut reader = tokio::io::BufReader::new(&mut socket);
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                if line.to_ascii_lowercase().starts_with("content-length:") {
+                                    content_length = line
+                                        .split(':')
+                                        .nth(1)
+                                        .unwrap_or("0")
+                                        .trim()
+                                        .parse()
+                                        .unwrap_or(0);
+                                }
+                                if line == "\r\n" || line == "\n" {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let mut remaining = content_length;
+                    let mut buf = vec![0u8; 8192];
+                    while remaining > 0 {
+                        let want = remaining.min(buf.len());
+                        match reader.read(&mut buf[..want]).await {
+                            Ok(0) => break,
+                            Ok(n) => remaining -= n,
+                            Err(_) => break,
+                        }
+                    }
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let (status, body) = {
+                        let mut q = queue.lock().unwrap();
+                        if q.len() > 1 {
+                            q.remove(0)
+                        } else {
+                            q[0].clone()
+                        }
+                    };
+                    let reason = match status {
+                        200 => "OK",
+                        429 => "Too Many Requests",
+                        500 => "Internal Server Error",
+                        503 => "Service Unavailable",
+                        _ => "Error",
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let stream = reader.into_inner();
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (
+            format!("http://{addr}"),
+            hits,
+        )
+    }
+
+    #[tokio::test]
+    async fn retry_fail_then_succeed_uses_bounded_backoff() {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        let (url, hits) = spawn_stub(vec![
+            (503u16, "busy".to_string()),
+            (503u16, "busy".to_string()),
+            (200u16, r#"{"ok":true}"#.to_string()),
+        ])
+        .await;
+        let client = reqwest::Client::new();
+        let body = serde_json::json!({"probe": 1});
+        let started = Instant::now();
+        let value = send_json_retry(
+            || client.post(url.clone()).json(&body),
+            10,
+            "stub",
+            3,
+        )
+        .await
+        .expect("third attempt succeeds");
+        assert_eq!(value["ok"], true);
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "exactly 3 attempts");
+        assert!(
+            started.elapsed() >= Duration::from_millis(2000),
+            "two backoff delays (800ms + 1.6s) must be observed"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_exhaustion_returns_last_error_after_bound_plus_one() {
+        use std::sync::atomic::Ordering;
+
+        let (url, hits) = spawn_stub(vec![(429u16, "slow down".to_string())]).await;
+        let client = reqwest::Client::new();
+        let body = serde_json::json!({});
+        let err = send_json_retry(|| client.post(url.clone()).json(&body), 10, "stub", 2)
+            .await
+            .expect_err("persistent 429 must exhaust");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            3,
+            "attempts must equal bound + 1"
+        );
+        assert!(
+            err.to_string().contains("429"),
+            "last error must surface the 429, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_zero_means_single_attempt() {
+        use std::sync::atomic::Ordering;
+
+        let (url, hits) = spawn_stub(vec![(500u16, "boom".to_string())]).await;
+        let client = reqwest::Client::new();
+        let body = serde_json::json!({});
+        let err = send_json_retry(|| client.post(url.clone()).json(&body), 10, "stub", 0)
+            .await
+            .expect_err("max_retries=0 must not retry");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "zero bound ⇒ one attempt");
+        assert!(
+            err.to_string().contains("500"),
+            "last error must surface the 500, got: {err}"
+        );
     }
 }

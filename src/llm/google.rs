@@ -13,6 +13,7 @@ pub struct Google {
     model: String,
     timeout_seconds: u64,
     temperature: f32,
+    max_retries: u8,
 }
 
 impl Google {
@@ -28,6 +29,7 @@ impl Google {
             model: client::model(config, "gemini-2.0-flash"),
             timeout_seconds: config.llm.timeout_s,
             temperature: config.llm.temperature,
+            max_retries: config.llm.max_retries,
         }
     }
 }
@@ -54,16 +56,19 @@ impl LlmProvider for Google {
             "generationConfig": {"temperature": self.temperature}
         });
         let started = Instant::now();
-        let value = client::send_json(
-            self.client
-                .post(format!(
-                    "{}/models/{}:generateContent",
-                    self.base_url, self.model
-                ))
-                .query(&[("key", &self.api_key)])
-                .json(&body),
+        let value = client::send_json_retry(
+            || {
+                self.client
+                    .post(format!(
+                        "{}/models/{}:generateContent",
+                        self.base_url, self.model
+                    ))
+                    .query(&[("key", &self.api_key)])
+                    .json(&body)
+            },
             self.timeout_seconds,
             "Google Gemini",
+            self.max_retries,
         )
         .await?;
         let parts = value
