@@ -134,4 +134,22 @@ mod tests {
         let config = crate::config::Config::from_map(&map).unwrap();
         assert_eq!(base_url(&config, "x"), "https://proxy.local/v1");
     }
+
+    #[test]
+    fn is_retryable_status_retries_429_and_5xx_only() {
+        // R1 predicate: 429/5xx (and network timeout in the loop) retry;
+        // every other 4xx fails fast.
+        for status in [429u16, 500, 502, 503, 504, 599] {
+            assert!(
+                is_retryable_status(status),
+                "status {status} should be retryable"
+            );
+        }
+        for status in [200u16, 201, 400, 401, 403, 404, 422] {
+            assert!(
+                !is_retryable_status(status),
+                "status {status} should fail fast"
+            );
+        }
+    }
 }
