@@ -7,9 +7,9 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     database::schema::{ColumnMatch, TableDetail},
-    database::{SqlServer, TableInfo},
+    database::{DatabaseRepository, SqlServer, TableInfo},
     llm::{default_provider, LlmProvider, Message},
-    security::{SecurityPolicy, SqlValidator},
+    security::{SecurityPolicy, SqlValidator, ValidatedSql},
 };
 
 use crate::audit::redaction::redact_content;
@@ -34,7 +34,7 @@ use super::{
 
 pub struct Agent {
     pub(crate) config: Config,
-    pub(crate) db: SqlServer,
+    pub(crate) db: Arc<dyn DatabaseRepository>,
     llm: Arc<dyn LlmProvider>,
     validator: SqlValidator,
     pub(crate) schema: Arc<RwLock<Option<SchemaCache>>>,
@@ -47,6 +47,18 @@ impl Agent {
     }
 
     pub fn with_llm(config: Config, llm: Arc<dyn LlmProvider>) -> Self {
+        let db: Arc<dyn DatabaseRepository> =
+            Arc::new(SqlServer::new(config.clone()));
+        Self::with_repository(config, llm, db)
+    }
+
+    /// Injection seam for tests: real code uses [`Self::with_llm`] (which wraps
+    /// `SqlServer`); tests pass a fake [`DatabaseRepository`].
+    pub fn with_repository(
+        config: Config,
+        llm: Arc<dyn LlmProvider>,
+        db: Arc<dyn DatabaseRepository>,
+    ) -> Self {
         let policy = SecurityPolicy {
             max_sql_length: config.limits.max_sql_length,
             allowed_tables: config.policy.allowed_tables.clone(),
@@ -59,7 +71,7 @@ impl Agent {
         };
 
         Self {
-            db: SqlServer::new(config.clone()),
+            db,
             llm,
 
             validator: SqlValidator::new(policy),
@@ -655,16 +667,20 @@ impl Agent {
             println!("🔐 Validando SQL...");
         }
 
-        if let Err(val_err) = self.validator.validate(sql) {
-            tracing::warn!("SQL validation blocked: {val_err}");
-            let out = format!(
-                "❌ Consulta bloqueada por política de seguridad: {val_err}\n\
-                 Ajusta tu consulta para cumplir la política (ej: solo lectura SELECT, sin comentarios, \
-                 máximo {} JOINs y únicamente tablas y columnas autorizadas).",
-                self.config.limits.max_joins
-            );
-            return Ok(limit_text(&out, self.config.limits.max_tool_result_chars));
-        }
+        // Security seam: only validator-approved SQL flows to the DB, by value.
+        let validated = match ValidatedSql::parse(&self.validator, sql) {
+            Ok(v) => v,
+            Err(crate::error::ValidationBlocked::Blocked(msg)) => {
+                tracing::warn!("SQL validation blocked: {msg}");
+                let out = format!(
+                    "❌ Consulta bloqueada por política de seguridad: {msg}\n\
+                     Ajusta tu consulta para cumplir la política (ej: solo lectura SELECT, sin comentarios, \
+                     máximo {} JOINs y únicamente tablas y columnas autorizadas).",
+                    self.config.limits.max_joins
+                );
+                return Ok(limit_text(&out, self.config.limits.max_tool_result_chars));
+            }
+        };
 
         if self.config.verbose {
             println!("✅ SQL válido");
@@ -675,7 +691,7 @@ impl Agent {
             json!({
                 "request_id": request_id,
                 "sql": if self.config.audit.capture_sql {
-                    json!(redact_content(sql))
+                    json!(redact_content(validated.as_str()))
                 } else {
                     json!("[REDACTED]")
                 }
@@ -687,7 +703,9 @@ impl Agent {
             println!("🗄️ Ejecutando consulta...");
         }
 
-        let result = match self.db.execute_read(sql).await {
+        // Save the approved text for logging before moving it into the DB call.
+        let sql_for_log = validated.as_str().to_owned();
+        let result = match self.db.execute_read(validated).await {
             Ok(r) => r,
             Err(e) => {
                 let msg = e.to_string();
@@ -705,7 +723,7 @@ impl Agent {
                     tracing::warn!(
                         "Invalid object name re-injected {} candidates for sql: {}",
                         allowed.len().min(17),
-                        sql
+                        sql_for_log
                     );
                     return Ok(limit_text(&out, self.config.limits.max_tool_result_chars));
                 } else {

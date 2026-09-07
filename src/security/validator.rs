@@ -1,4 +1,14 @@
-use anyhow::{bail, Result};
+use crate::error::ValidationBlocked;
+use crate::security::ValidatedSql;
+
+/// Local `blocked!` equivalent producing `ValidationBlocked` with identical messages.
+/// Every call site keeps its original format string verbatim; only the error
+/// type changes from `anyhow::Error` to `ValidationBlocked::Blocked`.
+macro_rules! blocked {
+    ($($arg:tt)*) => {
+        return Err(ValidationBlocked::Blocked(format!($($arg)*)))
+    };
+}
 use sqlparser::{
     ast::{
         Distinct, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentClause,
@@ -291,24 +301,24 @@ impl SqlValidator {
         Self { policy }
     }
 
-    pub fn validate(&self, sql: &str) -> Result<()> {
+    pub fn validate(&self, sql: &str) -> Result<ValidatedSql, ValidationBlocked> {
         let sql = sql.trim();
         if sql.is_empty() {
-            bail!("SQL vacío");
+            blocked!("SQL vacío");
         }
         if sql.len() > self.policy.max_sql_length {
-            bail!("SQL supera MAX_SQL_LENGTH");
+            blocked!("SQL supera MAX_SQL_LENGTH");
         }
         if self.policy.block_comments
             && (sql.contains("--") || sql.contains("/*") || sql.contains("*/"))
         {
-            bail!("Comentarios SQL no permitidos");
+            blocked!("Comentarios SQL no permitidos");
         }
 
         let statements = Parser::parse_sql(&MsSqlDialect {}, sql)
-            .map_err(|e| anyhow::anyhow!("SQL inválido: {e}"))?;
+            .map_err(|e| ValidationBlocked::Blocked(format!("SQL inválido: {e}")))?;
         if statements.len() != 1 {
-            bail!("Solo se permite un statement");
+            blocked!("Solo se permite un statement");
         }
 
         let upper = sql.to_ascii_uppercase();
@@ -330,14 +340,14 @@ impl SqlValidator {
             "KILL",
         ] {
             if contains_word(&upper, word) {
-                bail!("Operación/función bloqueada: {word}");
+                blocked!("Operación/función bloqueada: {word}");
             }
         }
 
         let statement = &statements[0];
         let query = match statement {
             Statement::Query(q) => q,
-            _ => bail!("Solo se permite SELECT/CTE SELECT"),
+            _ => blocked!("Solo se permite SELECT/CTE SELECT"),
         };
 
         let mut ctx = ValidationContext {
@@ -359,10 +369,10 @@ impl SqlValidator {
         self.validate_query(query, &mut ctx)?;
 
         if ctx.joins > self.policy.max_joins {
-            bail!("Demasiados JOINs: máximo {}", self.policy.max_joins);
+            blocked!("Demasiados JOINs: máximo {}", self.policy.max_joins);
         }
         if ctx.subqueries > self.policy.max_subqueries {
-            bail!(
+            blocked!(
                 "Demasiadas subconsultas: máximo {}",
                 self.policy.max_subqueries
             );
@@ -375,7 +385,7 @@ impl SqlValidator {
                     || n.contains("information_schema")
                     || n.starts_with("master.")
                 {
-                    bail!("Acceso a metadatos/sistema no permitido: {table}");
+                    blocked!("Acceso a metadatos/sistema no permitido: {table}");
                 }
             }
         }
@@ -386,7 +396,7 @@ impl SqlValidator {
                     continue;
                 }
                 if !allowed.contains(&normalize_table_name(table)) {
-                    bail!("Tabla no permitida: {table}");
+                    blocked!("Tabla no permitida: {table}");
                 }
             }
         }
@@ -397,18 +407,18 @@ impl SqlValidator {
             // `my_token` (MY + TOKEN boundary) is blocked.
             for ident in collect_identifiers(&statements[0]) {
                 if is_sensitive_column(&ident) {
-                    bail!("Columna sensible bloqueada: {ident}");
+                    blocked!("Columna sensible bloqueada: {ident}");
                 }
             }
         }
 
-        Ok(())
+        Ok(ValidatedSql::from_trusted(sql.to_owned()))
     }
 
-    fn validate_query(&self, query: &Query, ctx: &mut ValidationContext) -> Result<()> {
+    fn validate_query(&self, query: &Query, ctx: &mut ValidationContext) -> Result<(), ValidationBlocked> {
         if let Some(with) = &query.with {
             if !self.policy.allow_cte {
-                bail!("CTE/WITH no permitido");
+                blocked!("CTE/WITH no permitido");
             }
             for cte in &with.cte_tables {
                 ctx.ctes.insert(normalize_table_name(&cte.alias.name.value));
@@ -439,10 +449,10 @@ impl SqlValidator {
     }
 
     /// Re-enter validation for a nested query, enforcing the subquery budget.
-    fn validate_nested_query(&self, query: &Query, ctx: &mut ValidationContext) -> Result<()> {
+    fn validate_nested_query(&self, query: &Query, ctx: &mut ValidationContext) -> Result<(), ValidationBlocked> {
         ctx.subqueries += 1;
         if ctx.subqueries > self.policy.max_subqueries {
-            bail!(
+            blocked!(
                 "Demasiadas subconsultas: máximo {}",
                 self.policy.max_subqueries
             );
@@ -450,7 +460,7 @@ impl SqlValidator {
         self.validate_query(query, ctx)
     }
 
-    fn validate_set_expr(&self, expr: &SetExpr, ctx: &mut ValidationContext) -> Result<()> {
+    fn validate_set_expr(&self, expr: &SetExpr, ctx: &mut ValidationContext) -> Result<(), ValidationBlocked> {
         match expr {
             SetExpr::Select(select) => self.validate_select(select, ctx),
             SetExpr::SetOperation { left, right, .. } => {
@@ -460,19 +470,19 @@ impl SqlValidator {
             }
             SetExpr::Query(query) => self.validate_nested_query(query, ctx),
             SetExpr::Values(_) | SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Table(_) => {
-                bail!("Expresión SQL no permitida")
+                blocked!("Expresión SQL no permitida")
             }
         }
     }
 
-    fn validate_select(&self, select: &Select, ctx: &mut ValidationContext) -> Result<()> {
+    fn validate_select(&self, select: &Select, ctx: &mut ValidationContext) -> Result<(), ValidationBlocked> {
         // SELECT INTO creates a table: it is a write, never read-only.
         if select.into.is_some() {
-            bail!("SELECT INTO no permitido");
+            blocked!("SELECT INTO no permitido");
         }
         // Without FROM there is no allowlist scope to resolve.
         if select.from.is_empty() {
-            bail!("SELECT sin FROM no permitido");
+            blocked!("SELECT sin FROM no permitido");
         }
         // Alias-aware scope for wildcard resolution (FROM + JOINs).
         let scope = Scope::collect(&select.from);
@@ -536,7 +546,7 @@ impl SqlValidator {
         projection: &[SelectItem],
         scope: &Scope,
         ctx: &ValidationContext,
-    ) -> Result<()> {
+    ) -> Result<(), ValidationBlocked> {
         let mut has_wildcard = false;
         for item in projection {
             match item {
@@ -544,7 +554,7 @@ impl SqlValidator {
                 SelectItem::QualifiedWildcard(name, _) => {
                     has_wildcard = true;
                     if scope.resolve(name).is_none() {
-                        bail!("Wildcard con alcance desconocido: {name}");
+                        blocked!("Wildcard con alcance desconocido: {name}");
                     }
                 }
                 SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. } => {}
@@ -559,7 +569,7 @@ impl SqlValidator {
                         continue;
                     }
                     if !allowed.contains(&normalize_table_name(table)) {
-                        bail!("Tabla no permitida: {table}");
+                        blocked!("Tabla no permitida: {table}");
                     }
                 }
             }
@@ -571,7 +581,7 @@ impl SqlValidator {
         &self,
         twj: &TableWithJoins,
         ctx: &mut ValidationContext,
-    ) -> Result<()> {
+    ) -> Result<(), ValidationBlocked> {
         self.validate_table_factor(&twj.relation, ctx)?;
         ctx.joins += twj.joins.len();
         for join in &twj.joins {
@@ -581,7 +591,7 @@ impl SqlValidator {
         Ok(())
     }
 
-    fn validate_join_operator(&self, op: &JoinOperator, ctx: &mut ValidationContext) -> Result<()> {
+    fn validate_join_operator(&self, op: &JoinOperator, ctx: &mut ValidationContext) -> Result<(), ValidationBlocked> {
         match op {
             JoinOperator::Inner(c)
             | JoinOperator::LeftOuter(c)
@@ -608,7 +618,7 @@ impl SqlValidator {
         &self,
         constraint: &JoinConstraint,
         ctx: &mut ValidationContext,
-    ) -> Result<()> {
+    ) -> Result<(), ValidationBlocked> {
         match constraint {
             JoinConstraint::On(expr) => self.validate_expr(expr, ctx),
             JoinConstraint::Using(_) | JoinConstraint::Natural | JoinConstraint::None => Ok(()),
@@ -618,19 +628,19 @@ impl SqlValidator {
     /// Recursively walk an expression so subqueries hidden in projection,
     /// WHERE/HAVING, GROUP/ORDER BY, LIMIT/OFFSET, CASE, function arguments,
     /// or JOIN conditions re-enter query validation under budget.
-    fn validate_expr(&self, expr: &Expr, ctx: &mut ValidationContext) -> Result<()> {
+    fn validate_expr(&self, expr: &Expr, ctx: &mut ValidationContext) -> Result<(), ValidationBlocked> {
         match expr {
             // Leaves: no nested expressions or queries.
             Expr::Identifier(ident) => {
                 if is_at_variable(&ident.value) {
-                    bail!("Variable de sistema bloqueada: {}", ident.value);
+                    blocked!("Variable de sistema bloqueada: {}", ident.value);
                 }
                 Ok(())
             }
             Expr::CompoundIdentifier(idents) => {
                 for ident in idents {
                     if is_at_variable(&ident.value) {
-                        bail!("Variable de sistema bloqueada: {}", ident.value);
+                        blocked!("Variable de sistema bloqueada: {}", ident.value);
                     }
                 }
                 Ok(())
@@ -880,10 +890,10 @@ impl SqlValidator {
         }
     }
 
-    fn validate_function(&self, func: &Function, ctx: &mut ValidationContext) -> Result<()> {
+    fn validate_function(&self, func: &Function, ctx: &mut ValidationContext) -> Result<(), ValidationBlocked> {
         let name = func.name.0.last().map(|i| i.value.as_str()).unwrap_or("");
         if is_blocked_system_func(name) {
-            bail!("Función de sistema bloqueada: {name}");
+            blocked!("Función de sistema bloqueada: {name}");
         }
         self.validate_function_args(&func.parameters, ctx)?;
         self.validate_function_args(&func.args, ctx)?;
@@ -908,7 +918,7 @@ impl SqlValidator {
         &self,
         args: &FunctionArguments,
         ctx: &mut ValidationContext,
-    ) -> Result<()> {
+    ) -> Result<(), ValidationBlocked> {
         match args {
             FunctionArguments::None => Ok(()),
             FunctionArguments::Subquery(query) => self.validate_nested_query(query, ctx),
@@ -944,7 +954,7 @@ impl SqlValidator {
         &self,
         arg: &FunctionArgExpr,
         ctx: &mut ValidationContext,
-    ) -> Result<()> {
+    ) -> Result<(), ValidationBlocked> {
         match arg {
             FunctionArgExpr::Expr(e) => self.validate_expr(e, ctx),
             FunctionArgExpr::Wildcard | FunctionArgExpr::QualifiedWildcard(_) => Ok(()),
@@ -955,11 +965,11 @@ impl SqlValidator {
         &self,
         factor: &TableFactor,
         ctx: &mut ValidationContext,
-    ) -> Result<()> {
+    ) -> Result<(), ValidationBlocked> {
         match factor {
             TableFactor::Table { name, .. } => {
                 if name.0.len() > 2 {
-                    bail!("Referencias de servidor/base de datos no permitidas: {name}");
+                    blocked!("Referencias de servidor/base de datos no permitidas: {name}");
                 }
                 ctx.tables.insert(name.to_string());
             }
@@ -968,7 +978,7 @@ impl SqlValidator {
                 // derived tables fail fast instead of only at the final catch.
                 ctx.subqueries += 1;
                 if ctx.subqueries > self.policy.max_subqueries {
-                    bail!(
+                    blocked!(
                         "Demasiadas subconsultas: máximo {}",
                         self.policy.max_subqueries
                     );
@@ -981,10 +991,10 @@ impl SqlValidator {
                 self.validate_table_with_joins(table_with_joins, ctx)?;
             }
             TableFactor::TableFunction { .. } => {
-                bail!("Funciones de tabla no permitidas");
+                blocked!("Funciones de tabla no permitidas");
             }
             _ => {
-                bail!("Tipo de tabla no permitido");
+                blocked!("Tipo de tabla no permitido");
             }
         }
         Ok(())

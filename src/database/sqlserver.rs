@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use bb8::{ManageConnection, Pool, PooledConnection};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use futures_util::TryStreamExt;
@@ -16,10 +17,11 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use crate::{
     config::Config,
     database::{
+        repository::DatabaseRepository,
         schema::{ColumnMatch, ForeignKeyInfo, TableDetail},
         ColumnInfo, TableInfo,
     },
-    security::is_sensitive_column,
+    security::{is_sensitive_column, ValidatedSql},
     util::split_table_name,
 };
 
@@ -390,7 +392,8 @@ impl SqlServer {
         Ok(parse_column_rows(&rows))
     }
 
-    pub async fn execute_read(&self, sql: &str) -> Result<QueryResult> {
+    pub async fn execute_read(&self, validated: ValidatedSql) -> Result<QueryResult> {
+        let sql = validated.as_str();
         let _permit = self.query_gate.acquire().await?;
         let mut c = self.connection().await?;
         self.verify_read_only(&mut c).await?;
@@ -441,6 +444,33 @@ impl SqlServer {
             truncated,
             rows: result,
         })
+    }
+}
+
+#[async_trait]
+impl DatabaseRepository for SqlServer {
+    async fn ping(&self) -> Result<(String, String)> {
+        SqlServer::ping(self).await
+    }
+
+    async fn list_tables(&self) -> Result<Vec<TableInfo>> {
+        SqlServer::list_tables(self).await
+    }
+
+    async fn search_columns(&self, term: &str) -> Result<Vec<ColumnMatch>> {
+        SqlServer::search_columns(self, term).await
+    }
+
+    async fn describe_table_full(&self, table: &str) -> Result<TableDetail> {
+        SqlServer::describe_table_full(self, table).await
+    }
+
+    async fn describe_table(&self, table: &str) -> Result<Vec<ColumnInfo>> {
+        SqlServer::describe_table(self, table).await
+    }
+
+    async fn execute_read(&self, validated: ValidatedSql) -> Result<QueryResult> {
+        SqlServer::execute_read(self, validated).await
     }
 }
 
