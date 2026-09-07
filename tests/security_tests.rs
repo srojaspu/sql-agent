@@ -164,11 +164,11 @@ fn config_alias_blocked_tables_maps_to_allowed_exactly() {
     m.insert("DATABASE_PASSWORD".into(), "pass".into());
     m.insert("BLOCKED_TABLES".into(), "dbo.entradaLote".into());
     let cfg = Config::from_map(&m).expect("alias should map");
-    assert_eq!(cfg.allowed_tables, vec!["dbo.entradalote"]);
+    assert_eq!(cfg.policy.allowed_tables, vec!["dbo.entradalote"]);
     // validator with alias-derived allowlist must still block other tables
     let pol = sql_agent::security::SecurityPolicy {
         max_sql_length: 10000,
-        allowed_tables: cfg.allowed_tables.clone(),
+        allowed_tables: cfg.policy.allowed_tables.clone(),
         block_sensitive_columns: true,
         block_comments: true,
         allow_cte: true,
@@ -196,8 +196,8 @@ fn config_alias_precedence_no_widen() {
     m.insert("ALLOWED_TABLES".into(), "dbo.allowed".into());
     m.insert("BLOCKED_TABLES".into(), "dbo.blocked".into());
     let cfg = Config::from_map(&m).unwrap();
-    assert!(cfg.allowed_tables.contains(&"dbo.allowed".to_string()));
-    assert!(!cfg.allowed_tables.contains(&"dbo.blocked".to_string()));
+    assert!(cfg.policy.allowed_tables.contains(&"dbo.allowed".to_string()));
+    assert!(!cfg.policy.allowed_tables.contains(&"dbo.blocked".to_string()));
 }
 
 #[test]
@@ -211,7 +211,7 @@ fn config_max_agent_steps_alias_does_not_bypass_security() {
     m.insert("DATABASE_PASSWORD".into(), "pass".into());
     m.insert("MAX_AGENT_STEPS".into(), "20".into());
     let cfg = Config::from_map(&m).unwrap();
-    assert_eq!(cfg.max_steps, 20);
+    assert_eq!(cfg.limits.max_steps, 20);
     // max_steps larger must not disable validator
     let v2 = SqlValidator::new(sql_agent::security::SecurityPolicy {
         max_sql_length: 10000,

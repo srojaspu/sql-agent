@@ -36,19 +36,19 @@ struct Response {
 }
 
 impl Ollama {
+    /// Build over the shared client from [`super::client::build_client`].
+    ///
+    /// Infallible by construction: the client arrives already built, so
+    /// this constructor cannot panic.
     pub fn new(
         url: String,
         model: String,
         timeout_seconds: u64,
         temperature: f32,
-        connect_timeout: u64,
+        client: Client,
     ) -> Self {
         Self {
-            client: Client::builder()
-                .connect_timeout(Duration::from_secs(connect_timeout))
-                .pool_idle_timeout(Duration::from_secs(300))
-                .build()
-                .expect("No se pudo crear HTTP client"),
+            client,
             base_url: url.trim_end_matches('/').to_string(),
             model,
             timeout_seconds,

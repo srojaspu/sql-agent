@@ -1,274 +1,28 @@
-use anyhow::{bail, Result};
-use sqlparser::{
-    ast::{
-        Distinct, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentClause,
-        FunctionArguments, GroupByExpr, HavingBound, JoinConstraint, JoinOperator, JsonPathElem,
-        ObjectName, Query, Select, SelectItem, SetExpr, Statement, Subscript, TableFactor,
-        TableWithJoins, TopQuantity, WindowType,
-    },
-    dialect::MsSqlDialect,
-    parser::Parser,
-};
-use std::collections::{HashMap, HashSet};
+//! Facade validator: policy plus the single `validate` entry point.
+//!
+//! Slice E, step 2 (pure move): identifier collection lives in
+//! [`super::identifiers`], expression/function checks in [`super::expr`],
+//! query/table checks plus [`ValidationContext`](super::tables::ValidationContext)
+//! in [`super::tables`], wildcard scope in [`super::scope`]. No rule,
+//! message, limit, or ordering change here.
 
+use crate::error::ValidationBlocked;
+use crate::security::ValidatedSql;
+
+/// Local `bail!` equivalent producing `ValidationBlocked` with identical messages.
+/// Every call site keeps its original format string verbatim; only the error
+/// type changes from `anyhow::Error` to `ValidationBlocked::Blocked`.
+macro_rules! blocked {
+    ($($arg:tt)*) => {
+        return Err(ValidationBlocked::Blocked(format!($($arg)*)))
+    };
+}
+use sqlparser::{dialect::MsSqlDialect, parser::Parser, ast::Statement};
+
+use super::expr::contains_word;
+use super::identifiers::{collect_identifiers, is_sensitive_column};
+use super::tables::ValidationContext;
 use crate::util::normalize_table_name;
-
-/// Single source for sensitive names (validator + describe + redaction).
-pub const SENSITIVE_COLUMNS: &[&str] = &[
-    "PASSWORD",
-    "PASSWD",
-    "SECRET",
-    "TOKEN",
-    "ACCESS_TOKEN",
-    "REFRESH_TOKEN",
-    "API_KEY",
-    "PRIVATE_KEY",
-    "CLIENT_SECRET",
-];
-
-/// Exact case-insensitive match plus boundary parts (`my_token` -> MY + TOKEN).
-/// Strips brackets/quotes/qualifiers; `secretary`/`tokenizer` stay allowed.
-pub fn is_sensitive_column(name: &str) -> bool {
-    let norm = name
-        .rsplit('.')
-        .next()
-        .unwrap_or(name)
-        .trim()
-        .trim_matches(|c| c == '[' || c == ']' || c == '"' || c == '\'' || c == '`')
-        .to_ascii_uppercase();
-    if norm.is_empty() {
-        return false;
-    }
-    if SENSITIVE_COLUMNS.contains(&norm.as_str()) {
-        return true;
-    }
-    for part in norm.split(|c: char| !c.is_ascii_alphanumeric()) {
-        let p = part.trim_end_matches(|c: char| c.is_ascii_digit());
-        if !p.is_empty() && SENSITIVE_COLUMNS.contains(&p) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Walk the parsed statement and collect every identifier reference
-/// (column identifiers, compound parts, table names, function names).
-/// String literals, values, and comments never enter the AST as
-/// identifiers, so they are ignored by construction.
-fn collect_identifiers(statement: &Statement) -> Vec<String> {
-    let mut out = Vec::new();
-    if let Statement::Query(q) = statement {
-        collect_query_identifiers(q, &mut out);
-    }
-    out
-}
-
-fn collect_query_identifiers(query: &Query, out: &mut Vec<String>) {
-    if let Some(with) = &query.with {
-        for cte in &with.cte_tables {
-            collect_query_identifiers(&cte.query, out);
-        }
-    }
-    collect_set_expr_identifiers(&query.body, out);
-    if let Some(order_by) = &query.order_by {
-        for obe in &order_by.exprs {
-            collect_expr_identifiers(&obe.expr, out);
-        }
-    }
-    if let Some(limit) = &query.limit {
-        collect_expr_identifiers(limit, out);
-    }
-}
-
-fn collect_set_expr_identifiers(expr: &SetExpr, out: &mut Vec<String>) {
-    match expr {
-        SetExpr::Select(select) => collect_select_identifiers(select, out),
-        SetExpr::SetOperation { left, right, .. } => {
-            collect_set_expr_identifiers(left, out);
-            collect_set_expr_identifiers(right, out);
-        }
-        SetExpr::Query(query) => collect_query_identifiers(query, out),
-        SetExpr::Values(_) | SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Table(_) => {}
-    }
-}
-
-fn collect_select_identifiers(select: &Select, out: &mut Vec<String>) {
-    for item in &select.projection {
-        match item {
-            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                collect_expr_identifiers(expr, out)
-            }
-            SelectItem::QualifiedWildcard(name, _) => collect_object_name(name, out),
-            SelectItem::Wildcard(_) => {}
-        }
-    }
-    for twj in &select.from {
-        collect_table_with_joins_identifiers(twj, out);
-    }
-    if let Some(selection) = &select.selection {
-        collect_expr_identifiers(selection, out);
-    }
-    if let GroupByExpr::Expressions(exprs, _) = &select.group_by {
-        for expr in exprs {
-            collect_expr_identifiers(expr, out);
-        }
-    }
-    if let Some(having) = &select.having {
-        collect_expr_identifiers(having, out);
-    }
-}
-
-fn collect_table_with_joins_identifiers(twj: &TableWithJoins, out: &mut Vec<String>) {
-    collect_table_factor_identifiers(&twj.relation, out);
-    for join in &twj.joins {
-        collect_table_factor_identifiers(&join.relation, out);
-        collect_join_constraint(&join.join_operator, out);
-    }
-}
-
-fn collect_join_constraint(op: &JoinOperator, out: &mut Vec<String>) {
-    match op {
-        JoinOperator::Inner(c)
-        | JoinOperator::LeftOuter(c)
-        | JoinOperator::RightOuter(c)
-        | JoinOperator::FullOuter(c)
-        | JoinOperator::Semi(c)
-        | JoinOperator::LeftSemi(c)
-        | JoinOperator::RightSemi(c)
-        | JoinOperator::Anti(c)
-        | JoinOperator::LeftAnti(c)
-        | JoinOperator::RightAnti(c) => {
-            if let JoinConstraint::On(expr) = c {
-                collect_expr_identifiers(expr, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn collect_table_factor_identifiers(factor: &TableFactor, out: &mut Vec<String>) {
-    match factor {
-        TableFactor::Table { name, .. } => collect_object_name(name, out),
-        TableFactor::Derived { subquery, .. } => collect_query_identifiers(subquery, out),
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => collect_table_with_joins_identifiers(table_with_joins, out),
-        _ => {}
-    }
-}
-
-fn collect_object_name(name: &ObjectName, out: &mut Vec<String>) {
-    for part in &name.0 {
-        out.push(part.value.clone());
-    }
-}
-
-fn collect_function_identifiers(func: &Function, out: &mut Vec<String>) {
-    if let Some(last) = func.name.0.last() {
-        out.push(last.value.clone());
-    }
-    if let FunctionArguments::List(list) = &func.args {
-        for arg in &list.args {
-            match arg {
-                FunctionArg::Named { arg, .. } | FunctionArg::ExprNamed { arg, .. } => {
-                    if let FunctionArgExpr::Expr(e) = arg {
-                        collect_expr_identifiers(e, out);
-                    }
-                }
-                FunctionArg::Unnamed(arg) => {
-                    if let FunctionArgExpr::Expr(e) = arg {
-                        collect_expr_identifiers(e, out);
-                    }
-                }
-            }
-        }
-    }
-    if let FunctionArguments::Subquery(query) = &func.args {
-        collect_query_identifiers(query, out);
-    }
-}
-
-/// Collect identifiers; literals ignored by construction.
-fn collect_expr_identifiers(expr: &Expr, out: &mut Vec<String>) {
-    match expr {
-        Expr::Identifier(ident) => out.push(ident.value.clone()),
-        Expr::CompoundIdentifier(idents) => {
-            for ident in idents {
-                out.push(ident.value.clone());
-            }
-        }
-        Expr::Value(_)
-        | Expr::TypedString { .. }
-        | Expr::IntroducedString { .. }
-        | Expr::Wildcard(_)
-        | Expr::QualifiedWildcard(_, _)
-        | Expr::MatchAgainst { .. } => {}
-        Expr::IsNull(e)
-        | Expr::IsNotNull(e)
-        | Expr::Nested(e)
-        | Expr::Cast { expr: e, .. }
-        | Expr::UnaryOp { expr: e, .. }
-        | Expr::Named { expr: e, .. } => collect_expr_identifiers(e, out),
-        Expr::BinaryOp {
-            left: a, right: b, ..
-        } => {
-            collect_expr_identifiers(a, out);
-            collect_expr_identifiers(b, out);
-        }
-        Expr::Subquery(query)
-        | Expr::Exists {
-            subquery: query, ..
-        } => collect_query_identifiers(query, out),
-        Expr::InSubquery { expr, subquery, .. } => {
-            collect_expr_identifiers(expr, out);
-            collect_query_identifiers(subquery, out);
-        }
-        Expr::InList { expr, list, .. } => {
-            collect_expr_identifiers(expr, out);
-            for item in list {
-                collect_expr_identifiers(item, out);
-            }
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            collect_expr_identifiers(expr, out);
-            collect_expr_identifiers(low, out);
-            collect_expr_identifiers(high, out);
-        }
-        Expr::Like { expr, pattern, .. }
-        | Expr::ILike { expr, pattern, .. }
-        | Expr::SimilarTo { expr, pattern, .. }
-        | Expr::RLike { expr, pattern, .. } => {
-            collect_expr_identifiers(expr, out);
-            collect_expr_identifiers(pattern, out);
-        }
-        Expr::Case {
-            operand,
-            conditions,
-            results,
-            else_result,
-        } => {
-            if let Some(op) = operand {
-                collect_expr_identifiers(op, out);
-            }
-            for c in conditions {
-                collect_expr_identifiers(c, out);
-            }
-            for r in results {
-                collect_expr_identifiers(r, out);
-            }
-            if let Some(e) = else_result {
-                collect_expr_identifiers(e, out);
-            }
-        }
-        Expr::Function(f) => collect_function_identifiers(f, out),
-        // Exotic nesting (JSON/map/array/subscript/interval/method/grouping)
-        // cannot hide a sensitive reference in this agent's simple SELECTs;
-        // deferred to keep the walk reviewable. Literals stay ignored above.
-        _ => {}
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct SecurityPolicy {
@@ -283,7 +37,7 @@ pub struct SecurityPolicy {
 }
 
 pub struct SqlValidator {
-    policy: SecurityPolicy,
+    pub(crate) policy: SecurityPolicy,
 }
 
 impl SqlValidator {
@@ -291,24 +45,24 @@ impl SqlValidator {
         Self { policy }
     }
 
-    pub fn validate(&self, sql: &str) -> Result<()> {
+    pub fn validate(&self, sql: &str) -> Result<ValidatedSql, ValidationBlocked> {
         let sql = sql.trim();
         if sql.is_empty() {
-            bail!("SQL vacío");
+            blocked!("SQL vacío");
         }
         if sql.len() > self.policy.max_sql_length {
-            bail!("SQL supera MAX_SQL_LENGTH");
+            blocked!("SQL supera MAX_SQL_LENGTH");
         }
         if self.policy.block_comments
             && (sql.contains("--") || sql.contains("/*") || sql.contains("*/"))
         {
-            bail!("Comentarios SQL no permitidos");
+            blocked!("Comentarios SQL no permitidos");
         }
 
         let statements = Parser::parse_sql(&MsSqlDialect {}, sql)
-            .map_err(|e| anyhow::anyhow!("SQL inválido: {e}"))?;
+            .map_err(|e| ValidationBlocked::Blocked(format!("SQL inválido: {e}")))?;
         if statements.len() != 1 {
-            bail!("Solo se permite un statement");
+            blocked!("Solo se permite un statement");
         }
 
         let upper = sql.to_ascii_uppercase();
@@ -330,14 +84,14 @@ impl SqlValidator {
             "KILL",
         ] {
             if contains_word(&upper, word) {
-                bail!("Operación/función bloqueada: {word}");
+                blocked!("Operación/función bloqueada: {word}");
             }
         }
 
         let statement = &statements[0];
         let query = match statement {
             Statement::Query(q) => q,
-            _ => bail!("Solo se permite SELECT/CTE SELECT"),
+            _ => blocked!("Solo se permite SELECT/CTE SELECT"),
         };
 
         let mut ctx = ValidationContext {
@@ -359,10 +113,10 @@ impl SqlValidator {
         self.validate_query(query, &mut ctx)?;
 
         if ctx.joins > self.policy.max_joins {
-            bail!("Demasiados JOINs: máximo {}", self.policy.max_joins);
+            blocked!("Demasiados JOINs: máximo {}", self.policy.max_joins);
         }
         if ctx.subqueries > self.policy.max_subqueries {
-            bail!(
+            blocked!(
                 "Demasiadas subconsultas: máximo {}",
                 self.policy.max_subqueries
             );
@@ -375,7 +129,7 @@ impl SqlValidator {
                     || n.contains("information_schema")
                     || n.starts_with("master.")
                 {
-                    bail!("Acceso a metadatos/sistema no permitido: {table}");
+                    blocked!("Acceso a metadatos/sistema no permitido: {table}");
                 }
             }
         }
@@ -386,7 +140,7 @@ impl SqlValidator {
                     continue;
                 }
                 if !allowed.contains(&normalize_table_name(table)) {
-                    bail!("Tabla no permitida: {table}");
+                    blocked!("Tabla no permitida: {table}");
                 }
             }
         }
@@ -397,743 +151,13 @@ impl SqlValidator {
             // `my_token` (MY + TOKEN boundary) is blocked.
             for ident in collect_identifiers(&statements[0]) {
                 if is_sensitive_column(&ident) {
-                    bail!("Columna sensible bloqueada: {ident}");
+                    blocked!("Columna sensible bloqueada: {ident}");
                 }
             }
         }
 
-        Ok(())
+        Ok(ValidatedSql::from_trusted(sql.to_owned()))
     }
-
-    fn validate_query(&self, query: &Query, ctx: &mut ValidationContext) -> Result<()> {
-        if let Some(with) = &query.with {
-            if !self.policy.allow_cte {
-                bail!("CTE/WITH no permitido");
-            }
-            for cte in &with.cte_tables {
-                ctx.ctes.insert(normalize_table_name(&cte.alias.name.value));
-                self.validate_nested_query(&cte.query, ctx)?;
-            }
-        }
-        self.validate_set_expr(&query.body, ctx)?;
-        if let Some(order_by) = &query.order_by {
-            for obe in &order_by.exprs {
-                self.validate_expr(&obe.expr, ctx)?;
-            }
-        }
-        if let Some(limit) = &query.limit {
-            self.validate_expr(limit, ctx)?;
-        }
-        for expr in &query.limit_by {
-            self.validate_expr(expr, ctx)?;
-        }
-        if let Some(offset) = &query.offset {
-            self.validate_expr(&offset.value, ctx)?;
-        }
-        if let Some(fetch) = &query.fetch {
-            if let Some(quantity) = &fetch.quantity {
-                self.validate_expr(quantity, ctx)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Re-enter validation for a nested query, enforcing the subquery budget.
-    fn validate_nested_query(&self, query: &Query, ctx: &mut ValidationContext) -> Result<()> {
-        ctx.subqueries += 1;
-        if ctx.subqueries > self.policy.max_subqueries {
-            bail!(
-                "Demasiadas subconsultas: máximo {}",
-                self.policy.max_subqueries
-            );
-        }
-        self.validate_query(query, ctx)
-    }
-
-    fn validate_set_expr(&self, expr: &SetExpr, ctx: &mut ValidationContext) -> Result<()> {
-        match expr {
-            SetExpr::Select(select) => self.validate_select(select, ctx),
-            SetExpr::SetOperation { left, right, .. } => {
-                // Every UNION/EXCEPT/INTERSECT branch must be read-only.
-                self.validate_set_expr(left, ctx)?;
-                self.validate_set_expr(right, ctx)
-            }
-            SetExpr::Query(query) => self.validate_nested_query(query, ctx),
-            SetExpr::Values(_) | SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Table(_) => {
-                bail!("Expresión SQL no permitida")
-            }
-        }
-    }
-
-    fn validate_select(&self, select: &Select, ctx: &mut ValidationContext) -> Result<()> {
-        // SELECT INTO creates a table: it is a write, never read-only.
-        if select.into.is_some() {
-            bail!("SELECT INTO no permitido");
-        }
-        // Without FROM there is no allowlist scope to resolve.
-        if select.from.is_empty() {
-            bail!("SELECT sin FROM no permitido");
-        }
-        // Alias-aware scope for wildcard resolution (FROM + JOINs).
-        let scope = Scope::collect(&select.from);
-        self.check_wildcard_scope(&select.projection, &scope, ctx)?;
-        for item in &select.projection {
-            match item {
-                SelectItem::UnnamedExpr(expr) => self.validate_expr(expr, ctx)?,
-                SelectItem::ExprWithAlias { expr, .. } => self.validate_expr(expr, ctx)?,
-                SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => {}
-            }
-        }
-        if let Some(top) = &select.top {
-            if let Some(TopQuantity::Expr(expr)) = &top.quantity {
-                self.validate_expr(expr, ctx)?;
-            }
-        }
-        if let Some(Distinct::On(exprs)) = &select.distinct {
-            for expr in exprs {
-                self.validate_expr(expr, ctx)?;
-            }
-        }
-        for twj in &select.from {
-            self.validate_table_with_joins(twj, ctx)?;
-        }
-        if let Some(prewhere) = &select.prewhere {
-            self.validate_expr(prewhere, ctx)?;
-        }
-        if let Some(selection) = &select.selection {
-            self.validate_expr(selection, ctx)?;
-        }
-        match &select.group_by {
-            GroupByExpr::Expressions(exprs, _) => {
-                for expr in exprs {
-                    self.validate_expr(expr, ctx)?;
-                }
-            }
-            GroupByExpr::All(_) => {}
-        }
-        if let Some(having) = &select.having {
-            self.validate_expr(having, ctx)?;
-        }
-        if let Some(qualify) = &select.qualify {
-            self.validate_expr(qualify, ctx)?;
-        }
-        for expr in select
-            .cluster_by
-            .iter()
-            .chain(select.distribute_by.iter())
-            .chain(select.sort_by.iter())
-        {
-            self.validate_expr(expr, ctx)?;
-        }
-        Ok(())
-    }
-
-    /// Every wildcard in the projection must resolve to a known scope, and
-    /// every scoped base table must be allowlisted (CTEs excluded, mirroring
-    /// the global allowlist check).
-    fn check_wildcard_scope(
-        &self,
-        projection: &[SelectItem],
-        scope: &Scope,
-        ctx: &ValidationContext,
-    ) -> Result<()> {
-        let mut has_wildcard = false;
-        for item in projection {
-            match item {
-                SelectItem::Wildcard(_) => has_wildcard = true,
-                SelectItem::QualifiedWildcard(name, _) => {
-                    has_wildcard = true;
-                    if scope.resolve(name).is_none() {
-                        bail!("Wildcard con alcance desconocido: {name}");
-                    }
-                }
-                SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. } => {}
-            }
-        }
-        if has_wildcard {
-            // Reuse the prebuilt allowlist from the validation context instead
-            // of rebuilding the HashSet per SELECT scope.
-            if let Some(allowed) = &ctx.allowed {
-                for table in &scope.tables {
-                    if ctx.ctes.contains(&normalize_table_name(table)) {
-                        continue;
-                    }
-                    if !allowed.contains(&normalize_table_name(table)) {
-                        bail!("Tabla no permitida: {table}");
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_table_with_joins(
-        &self,
-        twj: &TableWithJoins,
-        ctx: &mut ValidationContext,
-    ) -> Result<()> {
-        self.validate_table_factor(&twj.relation, ctx)?;
-        ctx.joins += twj.joins.len();
-        for join in &twj.joins {
-            self.validate_table_factor(&join.relation, ctx)?;
-            self.validate_join_operator(&join.join_operator, ctx)?;
-        }
-        Ok(())
-    }
-
-    fn validate_join_operator(&self, op: &JoinOperator, ctx: &mut ValidationContext) -> Result<()> {
-        match op {
-            JoinOperator::Inner(c)
-            | JoinOperator::LeftOuter(c)
-            | JoinOperator::RightOuter(c)
-            | JoinOperator::FullOuter(c)
-            | JoinOperator::Semi(c)
-            | JoinOperator::LeftSemi(c)
-            | JoinOperator::RightSemi(c)
-            | JoinOperator::Anti(c)
-            | JoinOperator::LeftAnti(c)
-            | JoinOperator::RightAnti(c) => self.validate_join_constraint(c, ctx),
-            JoinOperator::CrossJoin | JoinOperator::CrossApply | JoinOperator::OuterApply => Ok(()),
-            JoinOperator::AsOf {
-                match_condition,
-                constraint,
-            } => {
-                self.validate_expr(match_condition, ctx)?;
-                self.validate_join_constraint(constraint, ctx)
-            }
-        }
-    }
-
-    fn validate_join_constraint(
-        &self,
-        constraint: &JoinConstraint,
-        ctx: &mut ValidationContext,
-    ) -> Result<()> {
-        match constraint {
-            JoinConstraint::On(expr) => self.validate_expr(expr, ctx),
-            JoinConstraint::Using(_) | JoinConstraint::Natural | JoinConstraint::None => Ok(()),
-        }
-    }
-
-    /// Recursively walk an expression so subqueries hidden in projection,
-    /// WHERE/HAVING, GROUP/ORDER BY, LIMIT/OFFSET, CASE, function arguments,
-    /// or JOIN conditions re-enter query validation under budget.
-    fn validate_expr(&self, expr: &Expr, ctx: &mut ValidationContext) -> Result<()> {
-        match expr {
-            // Leaves: no nested expressions or queries.
-            Expr::Identifier(ident) => {
-                if is_at_variable(&ident.value) {
-                    bail!("Variable de sistema bloqueada: {}", ident.value);
-                }
-                Ok(())
-            }
-            Expr::CompoundIdentifier(idents) => {
-                for ident in idents {
-                    if is_at_variable(&ident.value) {
-                        bail!("Variable de sistema bloqueada: {}", ident.value);
-                    }
-                }
-                Ok(())
-            }
-            Expr::Value(_)
-            | Expr::TypedString { .. }
-            | Expr::IntroducedString { .. }
-            | Expr::Wildcard(_)
-            | Expr::QualifiedWildcard(_, _)
-            | Expr::MatchAgainst { .. } => Ok(()),
-            // Single boxed expressions.
-            Expr::IsFalse(e)
-            | Expr::IsNotFalse(e)
-            | Expr::IsTrue(e)
-            | Expr::IsNotTrue(e)
-            | Expr::IsNull(e)
-            | Expr::IsNotNull(e)
-            | Expr::IsUnknown(e)
-            | Expr::IsNotUnknown(e)
-            | Expr::Nested(e)
-            | Expr::OuterJoin(e)
-            | Expr::Prior(e)
-            | Expr::Cast { expr: e, .. }
-            | Expr::Extract { expr: e, .. }
-            | Expr::Ceil { expr: e, .. }
-            | Expr::Floor { expr: e, .. }
-            | Expr::CompositeAccess { expr: e, .. }
-            | Expr::Collate { expr: e, .. }
-            | Expr::UnaryOp { expr: e, .. }
-            | Expr::Named { expr: e, .. } => self.validate_expr(e, ctx),
-            Expr::Lambda(l) => self.validate_expr(&l.body, ctx),
-            // Pairs of expressions.
-            Expr::IsDistinctFrom(a, b)
-            | Expr::IsNotDistinctFrom(a, b)
-            | Expr::BinaryOp {
-                left: a, right: b, ..
-            }
-            | Expr::AnyOp {
-                left: a, right: b, ..
-            }
-            | Expr::AllOp {
-                left: a, right: b, ..
-            } => {
-                self.validate_expr(a, ctx)?;
-                self.validate_expr(b, ctx)
-            }
-            // Subqueries re-enter query validation under budget.
-            Expr::Subquery(query)
-            | Expr::Exists {
-                subquery: query, ..
-            } => self.validate_nested_query(query, ctx),
-            Expr::InSubquery { expr, subquery, .. } => {
-                self.validate_expr(expr, ctx)?;
-                self.validate_nested_query(subquery, ctx)
-            }
-            Expr::InList { expr, list, .. } => {
-                self.validate_expr(expr, ctx)?;
-                for item in list {
-                    self.validate_expr(item, ctx)?;
-                }
-                Ok(())
-            }
-            Expr::InUnnest {
-                expr, array_expr, ..
-            } => {
-                self.validate_expr(expr, ctx)?;
-                self.validate_expr(array_expr, ctx)
-            }
-            Expr::Between {
-                expr, low, high, ..
-            } => {
-                self.validate_expr(expr, ctx)?;
-                self.validate_expr(low, ctx)?;
-                self.validate_expr(high, ctx)
-            }
-            Expr::Like { expr, pattern, .. }
-            | Expr::ILike { expr, pattern, .. }
-            | Expr::SimilarTo { expr, pattern, .. }
-            | Expr::RLike { expr, pattern, .. } => {
-                self.validate_expr(expr, ctx)?;
-                self.validate_expr(pattern, ctx)
-            }
-            Expr::Convert { expr, styles, .. } => {
-                self.validate_expr(expr, ctx)?;
-                for style in styles {
-                    self.validate_expr(style, ctx)?;
-                }
-                Ok(())
-            }
-            Expr::AtTimeZone {
-                timestamp,
-                time_zone,
-            } => {
-                self.validate_expr(timestamp, ctx)?;
-                self.validate_expr(time_zone, ctx)
-            }
-            Expr::Position { expr, r#in } => {
-                self.validate_expr(expr, ctx)?;
-                self.validate_expr(r#in, ctx)
-            }
-            Expr::Substring {
-                expr,
-                substring_from,
-                substring_for,
-                ..
-            } => {
-                self.validate_expr(expr, ctx)?;
-                if let Some(from) = substring_from {
-                    self.validate_expr(from, ctx)?;
-                }
-                if let Some(for_) = substring_for {
-                    self.validate_expr(for_, ctx)?;
-                }
-                Ok(())
-            }
-            Expr::Trim {
-                expr,
-                trim_what,
-                trim_characters,
-                ..
-            } => {
-                self.validate_expr(expr, ctx)?;
-                if let Some(what) = trim_what {
-                    self.validate_expr(what, ctx)?;
-                }
-                if let Some(chars) = trim_characters {
-                    for c in chars {
-                        self.validate_expr(c, ctx)?;
-                    }
-                }
-                Ok(())
-            }
-            Expr::Overlay {
-                expr,
-                overlay_what,
-                overlay_from,
-                overlay_for,
-            } => {
-                self.validate_expr(expr, ctx)?;
-                self.validate_expr(overlay_what, ctx)?;
-                self.validate_expr(overlay_from, ctx)?;
-                if let Some(for_) = overlay_for {
-                    self.validate_expr(for_, ctx)?;
-                }
-                Ok(())
-            }
-            Expr::JsonAccess { value, path } => {
-                self.validate_expr(value, ctx)?;
-                for elem in &path.path {
-                    if let JsonPathElem::Bracket { key } = elem {
-                        self.validate_expr(key, ctx)?;
-                    }
-                }
-                Ok(())
-            }
-            Expr::MapAccess { column, keys } => {
-                self.validate_expr(column, ctx)?;
-                for k in keys {
-                    self.validate_expr(&k.key, ctx)?;
-                }
-                Ok(())
-            }
-            Expr::Subscript { expr, subscript } => {
-                self.validate_expr(expr, ctx)?;
-                match subscript.as_ref() {
-                    Subscript::Index { index } => self.validate_expr(index, ctx),
-                    Subscript::Slice {
-                        lower_bound,
-                        upper_bound,
-                        stride,
-                    } => {
-                        if let Some(e) = lower_bound {
-                            self.validate_expr(e, ctx)?;
-                        }
-                        if let Some(e) = upper_bound {
-                            self.validate_expr(e, ctx)?;
-                        }
-                        if let Some(e) = stride {
-                            self.validate_expr(e, ctx)?;
-                        }
-                        Ok(())
-                    }
-                }
-            }
-            Expr::Case {
-                operand,
-                conditions,
-                results,
-                else_result,
-            } => {
-                if let Some(op) = operand {
-                    self.validate_expr(op, ctx)?;
-                }
-                for c in conditions {
-                    self.validate_expr(c, ctx)?;
-                }
-                for r in results {
-                    self.validate_expr(r, ctx)?;
-                }
-                if let Some(e) = else_result {
-                    self.validate_expr(e, ctx)?;
-                }
-                Ok(())
-            }
-            Expr::GroupingSets(sets) | Expr::Cube(sets) | Expr::Rollup(sets) => {
-                for set in sets {
-                    for e in set {
-                        self.validate_expr(e, ctx)?;
-                    }
-                }
-                Ok(())
-            }
-            Expr::Tuple(exprs) | Expr::Struct { values: exprs, .. } => {
-                for e in exprs {
-                    self.validate_expr(e, ctx)?;
-                }
-                Ok(())
-            }
-            Expr::Dictionary(fields) => {
-                for f in fields {
-                    self.validate_expr(&f.value, ctx)?;
-                }
-                Ok(())
-            }
-            Expr::Map(m) => {
-                for entry in &m.entries {
-                    self.validate_expr(&entry.key, ctx)?;
-                    self.validate_expr(&entry.value, ctx)?;
-                }
-                Ok(())
-            }
-            Expr::Array(a) => {
-                for e in &a.elem {
-                    self.validate_expr(e, ctx)?;
-                }
-                Ok(())
-            }
-            Expr::Interval(i) => self.validate_expr(&i.value, ctx),
-            Expr::Function(f) => self.validate_function(f, ctx),
-            Expr::Method(m) => {
-                self.validate_expr(&m.expr, ctx)?;
-                for f in &m.method_chain {
-                    self.validate_function(f, ctx)?;
-                }
-                Ok(())
-            }
-        }
-    }
-
-    fn validate_function(&self, func: &Function, ctx: &mut ValidationContext) -> Result<()> {
-        let name = func.name.0.last().map(|i| i.value.as_str()).unwrap_or("");
-        if is_blocked_system_func(name) {
-            bail!("Función de sistema bloqueada: {name}");
-        }
-        self.validate_function_args(&func.parameters, ctx)?;
-        self.validate_function_args(&func.args, ctx)?;
-        if let Some(filter) = &func.filter {
-            self.validate_expr(filter, ctx)?;
-        }
-        if let Some(WindowType::WindowSpec(spec)) = &func.over {
-            for e in &spec.partition_by {
-                self.validate_expr(e, ctx)?;
-            }
-            for obe in &spec.order_by {
-                self.validate_expr(&obe.expr, ctx)?;
-            }
-        }
-        for obe in &func.within_group {
-            self.validate_expr(&obe.expr, ctx)?;
-        }
-        Ok(())
-    }
-
-    fn validate_function_args(
-        &self,
-        args: &FunctionArguments,
-        ctx: &mut ValidationContext,
-    ) -> Result<()> {
-        match args {
-            FunctionArguments::None => Ok(()),
-            FunctionArguments::Subquery(query) => self.validate_nested_query(query, ctx),
-            FunctionArguments::List(list) => {
-                for arg in &list.args {
-                    match arg {
-                        FunctionArg::Named { arg, .. } | FunctionArg::ExprNamed { arg, .. } => {
-                            self.validate_function_arg_expr(arg, ctx)?
-                        }
-                        FunctionArg::Unnamed(arg) => self.validate_function_arg_expr(arg, ctx)?,
-                    }
-                }
-                for clause in &list.clauses {
-                    match clause {
-                        FunctionArgumentClause::OrderBy(exprs) => {
-                            for obe in exprs {
-                                self.validate_expr(&obe.expr, ctx)?;
-                            }
-                        }
-                        FunctionArgumentClause::Limit(e) => self.validate_expr(e, ctx)?,
-                        FunctionArgumentClause::Having(HavingBound(_, e)) => {
-                            self.validate_expr(e, ctx)?
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(())
-            }
-        }
-    }
-
-    fn validate_function_arg_expr(
-        &self,
-        arg: &FunctionArgExpr,
-        ctx: &mut ValidationContext,
-    ) -> Result<()> {
-        match arg {
-            FunctionArgExpr::Expr(e) => self.validate_expr(e, ctx),
-            FunctionArgExpr::Wildcard | FunctionArgExpr::QualifiedWildcard(_) => Ok(()),
-        }
-    }
-
-    fn validate_table_factor(
-        &self,
-        factor: &TableFactor,
-        ctx: &mut ValidationContext,
-    ) -> Result<()> {
-        match factor {
-            TableFactor::Table { name, .. } => {
-                if name.0.len() > 2 {
-                    bail!("Referencias de servidor/base de datos no permitidas: {name}");
-                }
-                ctx.tables.insert(name.to_string());
-            }
-            TableFactor::Derived { subquery, .. } => {
-                // Early budget check: bail before recursing so deeply nested
-                // derived tables fail fast instead of only at the final catch.
-                ctx.subqueries += 1;
-                if ctx.subqueries > self.policy.max_subqueries {
-                    bail!(
-                        "Demasiadas subconsultas: máximo {}",
-                        self.policy.max_subqueries
-                    );
-                }
-                self.validate_query(subquery, ctx)?;
-            }
-            TableFactor::NestedJoin {
-                table_with_joins, ..
-            } => {
-                self.validate_table_with_joins(table_with_joins, ctx)?;
-            }
-            TableFactor::TableFunction { .. } => {
-                bail!("Funciones de tabla no permitidas");
-            }
-            _ => {
-                bail!("Tipo de tabla no permitido");
-            }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Default)]
-struct ValidationContext {
-    tables: HashSet<String>,
-    ctes: HashSet<String>,
-    joins: usize,
-    subqueries: usize,
-    /// Allowlist built once in `validate` and shared with every scope check.
-    /// `None` means no allowlist is configured (all tables pass the gate).
-    allowed: Option<HashSet<String>>,
-}
-
-/// Alias-aware resolution of the tables visible to one SELECT scope.
-/// Built from FROM plus JOIN relations so `*` and `alias.*` can be
-/// scoped to known tables before the allowlist check runs.
-#[derive(Default)]
-struct Scope {
-    /// Normalized base table names visible in this scope.
-    tables: Vec<String>,
-    /// Normalized qualifier (alias, full name, or short name) to the base
-    /// table it refers to. `None` marks a derived table or CTE alias, which
-    /// has no base table of its own.
-    qualifiers: HashMap<String, Option<String>>,
-}
-
-impl Scope {
-    fn collect(from: &[TableWithJoins]) -> Self {
-        let mut scope = Scope::default();
-        for twj in from {
-            scope.collect_factor(&twj.relation);
-            for join in &twj.joins {
-                scope.collect_factor(&join.relation);
-            }
-        }
-        scope
-    }
-
-    fn collect_factor(&mut self, factor: &TableFactor) {
-        match factor {
-            TableFactor::Table { name, alias, .. } => {
-                let base = name.to_string();
-                let norm = normalize_table_name(&base);
-                if !self.tables.iter().any(|t| normalize_table_name(t) == norm) {
-                    self.tables.push(base.clone());
-                }
-                self.qualifiers
-                    .entry(norm)
-                    .or_insert_with(|| Some(base.clone()));
-                if let Some(short) = name.0.last() {
-                    self.qualifiers
-                        .entry(normalize_table_name(&short.value))
-                        .or_insert_with(|| Some(base.clone()));
-                }
-                if let Some(a) = alias {
-                    self.qualifiers
-                        .entry(normalize_table_name(&a.name.value))
-                        .or_insert_with(|| Some(base));
-                }
-            }
-            TableFactor::Derived { alias: Some(a), .. } => {
-                self.qualifiers
-                    .entry(normalize_table_name(&a.name.value))
-                    .or_insert(None);
-            }
-            TableFactor::Derived { .. } => {}
-            TableFactor::NestedJoin {
-                table_with_joins, ..
-            } => {
-                self.collect_factor(&table_with_joins.relation);
-                for join in &table_with_joins.joins {
-                    self.collect_factor(&join.relation);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Resolve a qualified wildcard prefix (`alias`, `table`, or
-    /// `schema.table`) to its base table, if the qualifier is known.
-    /// Returns `None` when the qualifier matches nothing in scope.
-    fn resolve(&self, name: &ObjectName) -> Option<Option<String>> {
-        if let Some(r) = self
-            .qualifiers
-            .get(&normalize_table_name(&name.to_string()))
-        {
-            return Some(r.clone());
-        }
-        if let Some(last) = name.0.last() {
-            if let Some(r) = self.qualifiers.get(&normalize_table_name(&last.value)) {
-                return Some(r.clone());
-            }
-        }
-        if let Some(first) = name.0.first() {
-            if let Some(r) = self.qualifiers.get(&normalize_table_name(&first.value)) {
-                return Some(r.clone());
-            }
-        }
-        None
-    }
-}
-
-/// Scalar system-information functions that must never appear, even when the
-/// query targets an allowlisted table (P0-2). Identity, host, database, and
-/// clock disclosure has no legitimate reporting use through this agent.
-/// `@@` variables are denied separately via [`is_at_variable`].
-fn is_blocked_system_func(name: &str) -> bool {
-    let upper = name
-        .trim()
-        .trim_matches(|c| c == '[' || c == ']' || c == '"')
-        .to_ascii_uppercase();
-    let short = upper.rsplit('.').next().unwrap_or(&upper);
-    if short.starts_with("@@") {
-        return true;
-    }
-    matches!(
-        short,
-        "SUSER_SNAME"
-            | "SUSER_SID"
-            | "SUSER_NAME"
-            | "SYSTEM_USER"
-            | "SESSION_USER"
-            | "ORIGINAL_LOGIN"
-            | "HOST_NAME"
-            | "HOST_ID"
-            | "APP_NAME"
-            | "DB_NAME"
-            | "DB_ID"
-            | "GETDATE"
-            | "GETUTCDATE"
-            | "SYSDATETIME"
-            | "SYSUTCDATETIME"
-            | "SYSDATETIMEOFFSET"
-    )
-}
-
-/// T-SQL system variables (`@@VERSION`, `@@SERVERNAME`, ...) parse as
-/// identifiers rather than function calls, so they need their own check.
-fn is_at_variable(name: &str) -> bool {
-    name.trim_start().starts_with("@@")
-}
-
-fn contains_word(sql: &str, word: &str) -> bool {
-    sql.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .any(|p| p.eq_ignore_ascii_case(word))
 }
 
 #[cfg(test)]

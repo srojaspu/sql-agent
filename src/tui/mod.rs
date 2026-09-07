@@ -1,10 +1,14 @@
 pub mod app;
-pub mod event;
+pub mod commands;
+pub mod draw;
+pub mod events;
 pub mod guard;
+pub mod input;
+pub mod state;
 pub mod ui;
 
 pub use app::AppState;
-pub use event::AppEvent;
+pub use events::AppEvent;
 pub use guard::TerminalGuard;
 
 // Helper to determine if we should launch TUI (pure logic for testing)

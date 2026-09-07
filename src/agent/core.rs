@@ -1,65 +1,44 @@
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::{
-    audit,
     config::Config,
-    database::schema::{upsert_schema_memory, ColumnMatch, SchemaMemory, TableDetail},
-    database::{ColumnInfo, SqlServer, TableInfo},
-    llm::{default_provider, LlmProvider, Message, ToolCall},
-    security::{is_sensitive_column, SecurityPolicy, SqlValidator},
-    util::split_table_name as shared_split_table,
+    database::schema::{ColumnMatch, TableDetail},
+    database::{DatabaseRepository, SqlServer, TableInfo},
+    llm::{default_provider, LlmProvider, Message},
+    security::{SecurityPolicy, SqlValidator, ValidatedSql},
 };
+
+use crate::audit::redaction::redact_content;
+use crate::audit::{AuditSink, FileAuditSink};
 
 use crate::agent::{
     prompt::SYSTEM_PROMPT,
-    session::{build_history_context, is_anaphoric, redact_content, Session, MAX_CHARS},
+    session::{build_history_context, is_anaphoric, Session, MAX_CHARS},
     tools,
 };
 
-/// Precomputed normalized names for one cached table, built once per
-/// `cached_schema` load so ranking never calls `normalize_term` per query.
-#[derive(Clone, Debug)]
-pub struct NormalizedEntry {
-    pub norm_full: String,
-    pub norm_table: String,
-}
-
-/// Precompute normalized (`schema.table` and `table`) names once per cache load.
-/// Ranking helpers take this slice instead of normalizing per table per call.
-pub fn precompute_normalized(tables: &[TableInfo]) -> Vec<NormalizedEntry> {
-    tables
-        .iter()
-        .map(|t| {
-            let full = format!("{}.{}", t.schema, t.table);
-            NormalizedEntry {
-                norm_full: normalize_term(&full),
-                norm_table: normalize_term(&t.table),
-            }
-        })
-        .collect()
-}
-
-#[derive(Clone, Debug)]
-struct SchemaCache {
-    expires_at: Instant,
-    tables: Arc<Vec<TableInfo>>,
-    normalized: Arc<Vec<NormalizedEntry>>,
-}
+use super::{
+    format::{
+        format_invalid_reinject, format_query_result, format_table_detail, format_table_list,
+        limit_text, looks_like_sql, split_table,
+    },
+    memory::{
+        build_schema_hint_text, dedup_key, normalize_tool_arguments, SchemaCache,
+    },
+    ranking::{search_with_fallback_masked, NormalizedEntry},
+};
 
 pub struct Agent {
-    config: Config,
-    db: SqlServer,
+    pub(crate) config: Config,
+    pub(crate) db: Arc<dyn DatabaseRepository>,
     llm: Arc<dyn LlmProvider>,
     validator: SqlValidator,
-    schema: Arc<RwLock<Option<SchemaCache>>>,
+    pub(crate) schema: Arc<RwLock<Option<SchemaCache>>>,
+    audit: Arc<dyn AuditSink>,
 }
 
 impl Agent {
@@ -68,24 +47,38 @@ impl Agent {
     }
 
     pub fn with_llm(config: Config, llm: Arc<dyn LlmProvider>) -> Self {
+        let db: Arc<dyn DatabaseRepository> =
+            Arc::new(SqlServer::new(config.clone()));
+        Self::with_repository(config, llm, db)
+    }
+
+    /// Injection seam for tests: real code uses [`Self::with_llm`] (which wraps
+    /// `SqlServer`); tests pass a fake [`DatabaseRepository`].
+    pub fn with_repository(
+        config: Config,
+        llm: Arc<dyn LlmProvider>,
+        db: Arc<dyn DatabaseRepository>,
+    ) -> Self {
         let policy = SecurityPolicy {
-            max_sql_length: config.max_sql_length,
-            allowed_tables: config.allowed_tables.clone(),
-            block_sensitive_columns: config.block_sensitive_columns,
-            block_comments: config.block_comments,
-            allow_cte: config.allow_cte,
-            allow_system_tables: config.allow_system_tables,
-            max_joins: config.max_joins,
-            max_subqueries: config.max_subqueries,
+            max_sql_length: config.limits.max_sql_length,
+            allowed_tables: config.policy.allowed_tables.clone(),
+            block_sensitive_columns: config.policy.block_sensitive_columns,
+            block_comments: config.policy.block_comments,
+            allow_cte: config.policy.allow_cte,
+            allow_system_tables: config.policy.allow_system_tables,
+            max_joins: config.limits.max_joins,
+            max_subqueries: config.limits.max_subqueries,
         };
 
         Self {
-            db: SqlServer::new(config.clone()),
+            db,
             llm,
 
             validator: SqlValidator::new(policy),
 
             schema: Arc::new(RwLock::new(None)),
+
+            audit: Arc::new(FileAuditSink::new(config.audit.path.clone())),
 
             config,
         }
@@ -126,7 +119,7 @@ impl Agent {
 
         let system = Message::system(format!(
             "{} Base de datos: {}.",
-            SYSTEM_PROMPT, self.config.database_name
+            SYSTEM_PROMPT, self.config.db.name
         ));
 
         let mut messages = vec![system, Message::user(question.to_string())];
@@ -141,9 +134,9 @@ impl Agent {
         // Per-turn same-call dedup: repeat returns the cached result + nudge.
         let mut seen: HashMap<String, String> = HashMap::new();
 
-        for step in 1..=self.config.max_steps {
+        for step in 1..=self.config.limits.max_steps {
             if self.config.verbose {
-                println!("\n━━━━━━━━ STEP {step}/{} ━━━━━━━━", self.config.max_steps);
+                println!("\n━━━━━━━━ STEP {step}/{} ━━━━━━━━", self.config.limits.max_steps);
             }
 
             let tool_defs = tools::definitions();
@@ -229,7 +222,7 @@ impl Agent {
                 println!("🔧 Tool calls: {}", reply.tool_calls.len());
             }
 
-            if reply.tool_calls.len() > self.config.max_tool_calls_per_step {
+            if reply.tool_calls.len() > self.config.limits.max_tool_calls_per_step {
                 anyhow::bail!("Demasiadas herramientas en un mismo paso");
             }
 
@@ -246,7 +239,7 @@ impl Agent {
             for call in reply
                 .tool_calls
                 .iter()
-                .take(self.config.max_tool_calls_per_step)
+                .take(self.config.limits.max_tool_calls_per_step)
             {
                 let name = call.function.name.as_str();
 
@@ -262,7 +255,7 @@ impl Agent {
                         "{cached} (duplicate call deduped — retry with different arguments if needed)"
                     )
                 } else {
-                    let out = self.dispatch_tool(call, &request_id).await?;
+                    let out = self.dispatch_tool(call, &request_id, None).await?;
                     seen.insert(dedup_k, out.clone());
                     out
                 };
@@ -297,7 +290,7 @@ impl Agent {
     pub fn build_messages_with_history(&self, session: &Session, question: &str) -> Vec<Message> {
         let mut system_content = format!(
             "{} Base de datos: {}.",
-            SYSTEM_PROMPT, self.config.database_name
+            SYSTEM_PROMPT, self.config.db.name
         );
         // Inject valid schema memory hints (TTL filtered, loop-guard capped)
         let hint_text = build_schema_hint_text(&session.schema_memory);
@@ -381,9 +374,9 @@ impl Agent {
         // Per-turn same-call dedup: repeat returns the cached result + nudge.
         let mut seen: HashMap<String, String> = HashMap::new();
 
-        for step in 1..=self.config.max_steps {
+        for step in 1..=self.config.limits.max_steps {
             if self.config.verbose {
-                println!("\n━━━━━━━━ STEP {step}/{} ━━━━━━━━", self.config.max_steps);
+                println!("\n━━━━━━━━ STEP {step}/{} ━━━━━━━━", self.config.limits.max_steps);
             }
             let tool_defs = tools::definitions();
             // messages already includes system + history + question; for LLM call we use the built messages clone
@@ -435,7 +428,7 @@ impl Agent {
                 continue;
             }
 
-            if reply.tool_calls.len() > self.config.max_tool_calls_per_step {
+            if reply.tool_calls.len() > self.config.limits.max_tool_calls_per_step {
                 anyhow::bail!("Demasiadas herramientas en un mismo paso");
             }
 
@@ -446,7 +439,7 @@ impl Agent {
             for call in reply
                 .tool_calls
                 .iter()
-                .take(self.config.max_tool_calls_per_step)
+                .take(self.config.limits.max_tool_calls_per_step)
             {
                 let name = call.function.name.as_str();
                 if self.config.verbose {
@@ -462,7 +455,7 @@ impl Agent {
                     )
                 } else {
                     let out = self
-                        .dispatch_tool_with_history(call, &request_id, session)
+                        .dispatch_tool(call, &request_id, Some(&mut *session))
                         .await?;
                     seen.insert(dedup_k, out.clone());
                     out
@@ -482,125 +475,12 @@ impl Agent {
         anyhow::bail!("Se alcanzó MAX_STEPS sin obtener una respuesta final")
     }
 
-    async fn dispatch_tool_with_history(
-        &self,
-        call: &ToolCall,
-        request_id: &str,
-        session: &mut Session,
-    ) -> Result<String> {
-        let args = normalize_tool_arguments(&call.function.arguments)?;
-        match call.function.name.as_str() {
-            "search_schema" => {
-                let query_raw = args
-                    .get("query")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                // Single ranking inside; reuse `matched` for memory (no
-                // second search_with_fallback, no per-table describe calls).
-                let (result, matched) = self.search_schema_ranked(&query_raw).await?;
-                for tbl in matched.iter().take(MEMORY_GROUNDING_LIMIT) {
-                    let key = format!("{}.{}", tbl.schema, tbl.table);
-                    // No DB fetch: ground with table identity + synonym only.
-                    // Empty columns preserve any previously stored full list.
-                    upsert_schema_memory(
-                        &mut session.schema_memory,
-                        key,
-                        tbl.clone(),
-                        Vec::new(),
-                        Some(query_raw.clone()),
-                        self.config.schema_cache_seconds,
-                    );
-                }
-                Ok(result)
-            }
-            "describe_table" => {
-                let table = args
-                    .get("table")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                // Single describe_table_full fetch; reuse its columns for
-                // memory instead of a second describe_table DB call.
-                let (result, cols) = self.describe_table_tool_with_detail(&args).await?;
-                let (schema, name) = split_table(&table);
-                let key = format!("{}.{}", schema, name);
-                let tbl = TableInfo {
-                    schema: schema.clone(),
-                    table: name.clone(),
-                    // Real type travels on discovery lists; unknown on this path.
-                    table_type: String::new(),
-                };
-                upsert_schema_memory(
-                    &mut session.schema_memory,
-                    key,
-                    tbl,
-                    cols,
-                    Some(table.clone()),
-                    self.config.schema_cache_seconds,
-                );
-                Ok(result)
-            }
-            "list_tables" => self.list_tables_tool().await,
-            "search_columns" => {
-                let query = args
-                    .get("query")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                let matches = self.search_columns_data(&query).await?;
-                // Reuse already-fetched match rows for memory (deduped by
-                // table, max MEMORY_GROUNDING_LIMIT tables, zero DB calls).
-                ground_memory_from_column_matches(
-                    &mut session.schema_memory,
-                    &matches,
-                    &query,
-                    self.config.schema_cache_seconds,
-                );
-                Ok(limit_text(
-                    &format_column_matches(&matches, &query),
-                    self.config.max_tool_result_chars,
-                ))
-            }
-            "execute_read_query" => self.execute_read_tool(&args, request_id).await,
-            other => anyhow::bail!("Tool no permitida: {other}"),
-        }
-    }
-
     /*
      * ================================================================
-     * VALIDADOR DE COMPLETITUD
+     * TOOL DISPATCH lives in `agent::dispatcher` (single unified
+     * `dispatch_tool` for both loops; no duplicated match arms).
      * ================================================================
      */
-
-    /*
-     * ================================================================
-     * TOOL DISPATCH
-     * ================================================================
-     */
-
-    async fn dispatch_tool(&self, call: &ToolCall, request_id: &str) -> Result<String> {
-        let args = normalize_tool_arguments(&call.function.arguments)?;
-
-        match call.function.name.as_str() {
-            "search_schema" => self.search_schema(&args).await,
-
-            "describe_table" => self.describe_table_tool(&args).await,
-
-            "list_tables" => self.list_tables_tool().await,
-
-            "search_columns" => self.search_columns_tool(&args).await,
-
-            "execute_read_query" => self.execute_read_tool(&args, request_id).await,
-
-            other => {
-                anyhow::bail!("Tool no permitida: {other}");
-            }
-        }
-    }
 
     /*
      * ================================================================
@@ -612,7 +492,7 @@ impl Agent {
     /// Returns (formatted_output, matched) so history dispatch reuses `matched`
     /// for memory without a second `search_with_fallback` call. The zero-hit
     /// top list comes from the same ranking pass (no re-rank loop).
-    async fn search_schema_ranked(&self, query_raw: &str) -> Result<(String, Vec<TableInfo>)> {
+    pub(crate) async fn search_schema_ranked(&self, query_raw: &str) -> Result<(String, Vec<TableInfo>)> {
         let snapshot = self.cached_schema().await?;
         let tables: &[TableInfo] = &snapshot.tables;
         let norm: &[NormalizedEntry] = &snapshot.normalized;
@@ -628,7 +508,7 @@ impl Agent {
             tables,
             norm,
             Some(&mask),
-            self.config.max_schema_results,
+            self.config.limits.max_schema_results,
         );
 
         if self.config.verbose {
@@ -682,19 +562,9 @@ impl Agent {
         }
 
         Ok((
-            limit_text(&output, self.config.max_tool_result_chars),
+            limit_text(&output, self.config.limits.max_tool_result_chars),
             matched,
         ))
-    }
-
-    async fn search_schema(&self, args: &Value) -> Result<String> {
-        let query_raw = args
-            .get("query")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        Ok(self.search_schema_ranked(&query_raw).await?.0)
     }
 
     /*
@@ -706,7 +576,7 @@ impl Agent {
     /// Describe once and return (formatted_output, columns): history dispatch
     /// reuses `columns` for schema memory instead of a second `describe_table`
     /// DB call. Single `describe_table_full` fetch, same format as before.
-    async fn describe_table_tool_with_detail(
+    pub(crate) async fn describe_table_tool_with_detail(
         &self,
         args: &Value,
     ) -> Result<(String, Vec<crate::database::ColumnInfo>)> {
@@ -738,7 +608,7 @@ impl Agent {
         Ok((
             limit_text(
                 &format_table_detail(&schema, &name, &detail),
-                self.config.max_tool_result_chars,
+                self.config.limits.max_tool_result_chars,
             ),
             detail.columns,
         ))
@@ -755,7 +625,7 @@ impl Agent {
      */
 
     /// List every visible table and view (SG-1). Cached via `cached_tables`.
-    async fn list_tables_tool(&self) -> Result<String> {
+    pub(crate) async fn list_tables_tool(&self) -> Result<String> {
         let tables = self.cached_tables().await?;
         let allowed: Vec<TableInfo> = tables
             .iter()
@@ -764,12 +634,12 @@ impl Agent {
             .collect();
         Ok(limit_text(
             &format_table_list(&allowed),
-            self.config.max_tool_result_chars,
+            self.config.limits.max_tool_result_chars,
         ))
     }
 
     /// Structured column search filtered by the allowlist (SG-1).
-    async fn search_columns_data(&self, query: &str) -> Result<Vec<ColumnMatch>> {
+    pub(crate) async fn search_columns_data(&self, query: &str) -> Result<Vec<ColumnMatch>> {
         if query.trim().is_empty() {
             anyhow::bail!("Falta query");
         }
@@ -780,28 +650,13 @@ impl Agent {
             .collect())
     }
 
-    /// Formatted column search for the LLM (SG-1).
-    async fn search_columns_tool(&self, args: &Value) -> Result<String> {
-        let query = args
-            .get("query")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let matches = self.search_columns_data(&query).await?;
-        Ok(limit_text(
-            &format_column_matches(&matches, &query),
-            self.config.max_tool_result_chars,
-        ))
-    }
-
     /*
      * ================================================================
      * EXECUTE READ QUERY
      * ================================================================
      */
 
-    async fn execute_read_tool(&self, args: &Value, request_id: &str) -> Result<String> {
+    pub(crate) async fn execute_read_tool(&self, args: &Value, request_id: &str) -> Result<String> {
         let sql = args.get("sql").and_then(Value::as_str).unwrap_or("").trim();
 
         if sql.is_empty() {
@@ -812,16 +667,20 @@ impl Agent {
             println!("🔐 Validando SQL...");
         }
 
-        if let Err(val_err) = self.validator.validate(sql) {
-            tracing::warn!("SQL validation blocked: {val_err}");
-            let out = format!(
-                "❌ Consulta bloqueada por política de seguridad: {val_err}\n\
-                 Ajusta tu consulta para cumplir la política (ej: solo lectura SELECT, sin comentarios, \
-                 máximo {} JOINs y únicamente tablas y columnas autorizadas).",
-                self.config.max_joins
-            );
-            return Ok(limit_text(&out, self.config.max_tool_result_chars));
-        }
+        // Security seam: only validator-approved SQL flows to the DB, by value.
+        let validated = match ValidatedSql::parse(&self.validator, sql) {
+            Ok(v) => v,
+            Err(crate::error::ValidationBlocked::Blocked(msg)) => {
+                tracing::warn!("SQL validation blocked: {msg}");
+                let out = format!(
+                    "❌ Consulta bloqueada por política de seguridad: {msg}\n\
+                     Ajusta tu consulta para cumplir la política (ej: solo lectura SELECT, sin comentarios, \
+                     máximo {} JOINs y únicamente tablas y columnas autorizadas).",
+                    self.config.limits.max_joins
+                );
+                return Ok(limit_text(&out, self.config.limits.max_tool_result_chars));
+            }
+        };
 
         if self.config.verbose {
             println!("✅ SQL válido");
@@ -831,8 +690,8 @@ impl Agent {
             "sql_approved",
             json!({
                 "request_id": request_id,
-                "sql": if self.config.audit_sql {
-                    json!(redact_content(sql))
+                "sql": if self.config.audit.capture_sql {
+                    json!(redact_content(validated.as_str()))
                 } else {
                     json!("[REDACTED]")
                 }
@@ -844,7 +703,9 @@ impl Agent {
             println!("🗄️ Ejecutando consulta...");
         }
 
-        let result = match self.db.execute_read(sql).await {
+        // Save the approved text for logging before moving it into the DB call.
+        let sql_for_log = validated.as_str().to_owned();
+        let result = match self.db.execute_read(validated).await {
             Ok(r) => r,
             Err(e) => {
                 let msg = e.to_string();
@@ -862,9 +723,9 @@ impl Agent {
                     tracing::warn!(
                         "Invalid object name re-injected {} candidates for sql: {}",
                         allowed.len().min(17),
-                        sql
+                        sql_for_log
                     );
-                    return Ok(limit_text(&out, self.config.max_tool_result_chars));
+                    return Ok(limit_text(&out, self.config.limits.max_tool_result_chars));
                 } else {
                     tracing::warn!("SQL execution error returned for self-correction: {msg}");
                     let out = format!(
@@ -873,7 +734,7 @@ impl Agent {
                          verifica las columnas reales con describe_table o search_columns. \
                          Corrige la consulta y ejecútala nuevamente."
                     );
-                    return Ok(limit_text(&out, self.config.max_tool_result_chars));
+                    return Ok(limit_text(&out, self.config.limits.max_tool_result_chars));
                 }
             }
         };
@@ -892,7 +753,7 @@ impl Agent {
          */
         let formatted = format_query_result(&result.rows, result.truncated);
 
-        Ok(limit_text(&formatted, self.config.max_tool_result_chars))
+        Ok(limit_text(&formatted, self.config.limits.max_tool_result_chars))
     }
 
     /*
@@ -902,8 +763,8 @@ impl Agent {
      */
 
     async fn audit(&self, event: &str, payload: Value) -> Result<()> {
-        if self.config.audit_enabled {
-            audit::write(&self.config.audit_path, event, payload).await?;
+        if self.config.audit.enabled {
+            self.audit.write(event, payload).await?;
         }
 
         Ok(())
@@ -911,84 +772,7 @@ impl Agent {
 
     /*
      * ================================================================
-     * SCHEMA CACHE
-     * ================================================================
-     */
-
-    /// Cheap snapshot of the schema cache: clones two `Arc`s, never the table Vec.
-    /// Ranking callers use `snapshot.tables` as a slice plus `snapshot.normalized`
-    /// so `normalize_term` runs once per cache load, not per table per query.
-    async fn cached_schema(&self) -> Result<SchemaCache> {
-        {
-            let guard = self.schema.read().await;
-
-            if let Some(cache) = &*guard {
-                if cache.expires_at > Instant::now() {
-                    if self.config.verbose {
-                        println!("⚡ Esquema desde caché");
-                    }
-
-                    return Ok(cache.clone());
-                }
-            }
-        }
-
-        if self.config.verbose {
-            println!(
-                "🗄️ SQL Server → \
-                 INFORMATION_SCHEMA.TABLES..."
-            );
-        }
-
-        let tables = self.db.list_tables().await?;
-
-        if self.config.verbose {
-            println!("🔎 search_schema: {} tablas encontradas", tables.len());
-        }
-
-        // Validate allowlist vs live (drift detection)
-        if !self.config.allowed_tables.is_empty() {
-            let live_names: Vec<String> = tables
-                .iter()
-                .map(|t| format!("{}.{}", t.schema, t.table))
-                .collect();
-            let drifted = Config::find_drifted(&self.config.allowed_tables, &live_names);
-            if !drifted.is_empty() {
-                tracing::warn!(
-                    drifted = ?drifted,
-                    "Allowlist drift: allowed tables not found in live DB"
-                );
-                if self.config.verbose {
-                    println!(
-                        "⚠️ Allowlist drift: no encontradas en BD: {}",
-                        drifted.join(", ")
-                    );
-                }
-            }
-        }
-
-        /*
-         * Guardamos copia del esquema with precomputed normalized names.
-         */
-
-        let cache = SchemaCache {
-            expires_at: Instant::now() + Duration::from_secs(self.config.schema_cache_seconds),
-            normalized: Arc::new(precompute_normalized(&tables)),
-            tables: Arc::new(tables),
-        };
-        *self.schema.write().await = Some(cache.clone());
-
-        Ok(cache)
-    }
-
-    /// Tables-only view of the cache (cheap `Arc` clone, no Vec copy).
-    async fn cached_tables(&self) -> Result<Arc<Vec<TableInfo>>> {
-        Ok(self.cached_schema().await?.tables)
-    }
-
-    /*
-     * ================================================================
-     * TABLE ALLOWLIST
+     * TUI HELPERS (cache + allowlist live in `agent::memory`)
      * ================================================================
      */
 
@@ -1003,7 +787,7 @@ impl Agent {
             Ok("No hay tablas visibles para tu filtro.".to_string())
         } else {
             let mut out = format!("Tablas disponibles ({}):\n", allowed.len());
-            for t in allowed.iter().take(self.config.max_schema_results) {
+            for t in allowed.iter().take(self.config.limits.max_schema_results) {
                 out.push_str(&format!("  • {}.{}\n", t.schema, t.table));
             }
             Ok(out)
@@ -1021,1023 +805,11 @@ impl Agent {
         *self.schema.write().await = None;
     }
 
-    fn table_allowed(&self, schema: &str, table: &str) -> bool {
-        /*
-         * Nunca permitir esquemas del sistema
-         * si la política está desactivada.
-         */
-
-        if !self.config.allow_system_tables
-            && (schema.eq_ignore_ascii_case("sys")
-                || schema.eq_ignore_ascii_case("information_schema"))
-        {
-            return false;
-        }
-
-        /*
-         * Si no existe allowlist,
-         * permitimos las tablas visibles
-         * excepto las de sistema.
-         */
-
-        if self.config.allowed_tables.is_empty() {
-            return true;
-        }
-
-        let full = format!("{}.{}", schema, table).to_ascii_lowercase();
-
-        self.config
-            .allowed_tables
-            .iter()
-            .any(|x| x.eq_ignore_ascii_case(&full) || x.eq_ignore_ascii_case(table))
-    }
-}
-
-/*
- * ====================================================================
- * TOOL ARGUMENTS
- * ====================================================================
- */
-
-fn normalize_tool_arguments(v: &Value) -> Result<Value> {
-    match v {
-        Value::Object(_) => Ok(v.clone()),
-
-        Value::String(s) => {
-            serde_json::from_str(s).context("Argumentos de tool no son JSON válido")
-        }
-
-        _ => {
-            anyhow::bail!(
-                "Argumentos de tool deben ser \
-                 un objeto JSON"
-            );
-        }
-    }
-}
-
-/*
- * ====================================================================
- * TABLE NAME
- * ====================================================================
- */
-
-fn split_table(s: &str) -> (String, String) {
-    // Shared core handles trim/strip/split/dbo-default; keep the warn here
-    // so the sqlserver path stays silent as before.
-    let out = shared_split_table(s);
-    if !s.contains('.') {
-        tracing::warn!(
-            "split_table: no schema supplied for '{}', defaulting to dbo (explicit schema recommended)",
-            s
-        );
-    }
-    out
-}
-
-pub fn split_table_pub(s: &str) -> (String, String) {
-    split_table(s)
-}
-
-/*
- * ====================================================================
- * LIMIT TEXT
- * ====================================================================
- */
-
-fn limit_text(text: &str, max: usize) -> String {
-    if text.len() <= max {
-        return text.to_string();
-    }
-
-    let mut end = max.min(text.len());
-
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-
-    format!("{}...[resultado recortado]", &text[..end])
-}
-
-/*
- * ====================================================================
- * SQL DETECTION
- * ====================================================================
- */
-
-fn looks_like_sql(s: &str) -> bool {
-    let t = s.trim_start().to_ascii_uppercase();
-
-    t.starts_with("SELECT ") || t == "SELECT" || t.starts_with("WITH ") || t == "WITH"
-}
-
-/*
- * ====================================================================
- * SEARCH HARDENING HELPERS (P0/P1 grounding)
- * ====================================================================
- */
-
-pub fn strip_accents(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'á' | 'à' | 'ä' | 'â' => 'a',
-            'Á' | 'À' | 'Ä' | 'Â' => 'A',
-            'é' | 'è' | 'ë' | 'ê' => 'e',
-            'É' | 'È' | 'Ë' | 'Ê' => 'E',
-            'í' | 'ì' | 'ï' | 'î' => 'i',
-            'Í' | 'Ì' | 'Ï' | 'Î' => 'I',
-            'ó' | 'ò' | 'ö' | 'ô' => 'o',
-            'Ó' | 'Ò' | 'Ö' | 'Ô' => 'O',
-            'ú' | 'ù' | 'ü' | 'û' => 'u',
-            'Ú' | 'Ù' | 'Ü' | 'Û' => 'U',
-            'ñ' => 'n',
-            'Ñ' => 'N',
-            'ç' => 'c',
-            'Ç' => 'C',
-            _ => c,
-        })
-        .collect()
-}
-
-pub fn singularize(s: &str) -> String {
-    if s.len() > 3 && s.ends_with("es") {
-        s[..s.len() - 2].to_string()
-    } else if s.len() > 2 && s.ends_with('s') {
-        s[..s.len() - 1].to_string()
-    } else {
-        s.to_string()
-    }
-}
-
-pub fn levenshtein(a: &str, b: &str) -> usize {
-    let a_chars: Vec<char> = a.chars().collect();
-    let b_chars: Vec<char> = b.chars().collect();
-    let n = a_chars.len();
-    let m = b_chars.len();
-    if n == 0 {
-        return m;
-    }
-    if m == 0 {
-        return n;
-    }
-    let mut prev: Vec<usize> = (0..=m).collect();
-    let mut curr = vec![0; m + 1];
-    for i in 1..=n {
-        curr[0] = i;
-        for j in 1..=m {
-            let cost = if a_chars[i - 1] == b_chars[j - 1] {
-                0
-            } else {
-                1
-            };
-            curr[j] = std::cmp::min(
-                std::cmp::min(prev[j] + 1, curr[j - 1] + 1),
-                prev[j - 1] + cost,
-            );
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-    prev[m]
-}
-
-pub fn normalize_term(s: &str) -> String {
-    let lower = s.to_lowercase();
-    let stripped = strip_accents(&lower);
-    singularize(&stripped)
-}
-
-/// Format the full table/view listing for the LLM (SG-1 discovery).
-/// Pure helper: every entry shows schema, name and type (BASE TABLE / VIEW).
-pub fn format_table_list(tables: &[TableInfo]) -> String {
-    let mut out = format!("✓ TABLAS Y VISTAS: {}\n", tables.len());
-    if tables.is_empty() {
-        out.push_str(
-            "No hay tablas visibles para tu filtro.\n\
-             ⚠️ No inventes nombres de tabla; pide aclaración o ajusta el filtro.\n",
-        );
-    } else {
-        for t in tables {
-            out.push_str(&format!(
-                "  • {}.{} [{}]\n",
-                t.schema, t.table, t.table_type
-            ));
-        }
-        out.push_str(
-            "\n→ SIGUIENTE PASO: usa describe_table con el nombre calificado \
-             EXACTO de la lista, o search_columns para buscar por columna.\n",
-        );
-    }
-    out
-}
-
-/// Format column search results for the LLM (SG-1 discovery).
-/// Pure helper: every match shows its qualified table.column pair.
-pub fn format_column_matches(matches: &[ColumnMatch], query: &str) -> String {
-    let mut out = format!("✓ COLUMNAS para '{query}': {}\n", matches.len());
-    if matches.is_empty() {
-        out.push_str(&format!(
-            "No se encontraron columnas para '{query}'.\n\
-             → Usa list_tables para explorar el esquema completo; \
-             no inventes nombres de columna.\n"
-        ));
-    } else {
-        for m in matches {
-            out.push_str(&format!(
-                "  • {}.{}.{} ({})\n",
-                m.schema, m.table, m.column, m.data_type
-            ));
-        }
-        out.push_str(
-            "\n→ SIGUIENTE PASO: usa describe_table con la tabla EXACTA \
-             de la lista y luego execute_read_query.\n",
-        );
-    }
-    out
-}
-
-/// Format a single JSON cell for LLM display (shared by the execute_read
-/// row path and the describe sample path so both render identically).
-/// `Null` renders as `[NULL]`; anything without a scalar mapping renders
-/// as `[complex]` instead of leaking debug output.
-pub fn format_cell_value(v: &Value) -> String {
-    match v {
-        Value::Null => "[NULL]".to_string(),
-        Value::Number(n) => n.to_string(),
-        Value::String(s) => s.clone(),
-        Value::Bool(b) => b.to_string(),
-        _ => "[complex]".to_string(),
-    }
-}
-
-/// Format query rows for the LLM, redacting sensitive values by header.
-/// Defense-in-depth: even if a sensitive value reaches this layer (e.g.
-/// legacy `SELECT *`), the header check renders `[REDACTED]` instead.
-pub fn format_query_result(rows: &[Value], truncated: bool) -> String {
-    let mut formatted = format!("✓ RESULTADOS ({} filas)\n\n", rows.len());
-    if rows.is_empty() {
-        formatted.push_str("No se encontraron datos.\n");
-    } else {
-        for (idx, row) in rows.iter().enumerate() {
-            formatted.push_str(&format!("Fila {}:\n", idx + 1));
-            if let Some(obj) = row.as_object() {
-                for (key, val) in obj {
-                    let display_val = if is_sensitive_column(key) {
-                        "[REDACTED]".to_string()
-                    } else {
-                        format_cell_value(val)
-                    };
-                    formatted.push_str(&format!("  {key} = {display_val}\n"));
-                }
-            } else {
-                formatted.push_str(&format!("  {row}\n"));
-            }
-            formatted.push('\n');
-        }
-    }
-    if truncated {
-        formatted.push_str("\n[Nota: Resultado limitado al máximo configurado]\n");
-    }
-    formatted
-}
-
-/// Format the enriched describe output for the LLM (SG-2).
-/// Pure helper: ESTRUCTURA + PK + FK + [VIEW definition] + MUESTRA + COUNT(*).
-pub fn format_table_detail(schema: &str, name: &str, detail: &TableDetail) -> String {
-    let mut out = format!("\n✓ ESTRUCTURA DE {schema}.{name}\n\nCOLUMNAS:\n");
-    for col in &detail.columns {
-        out.push_str(&format!(
-            "  • {} ({}){}\n",
-            col.column,
-            col.data_type,
-            if col.nullable {
-                " [NULLABLE]"
-            } else {
-                " [NO NULO]"
-            }
-        ));
-    }
-
-    if detail.primary_keys.is_empty() {
-        out.push_str("\nPRIMARY KEY: (ninguna)\n");
-    } else {
-        out.push_str(&format!(
-            "\nPRIMARY KEY: {}\n",
-            detail.primary_keys.join(", ")
-        ));
-    }
-
-    if detail.foreign_keys.is_empty() {
-        out.push_str("FOREIGN KEYS: (ninguna)\n");
-    } else {
-        out.push_str("FOREIGN KEYS:\n");
-        for fk in &detail.foreign_keys {
-            out.push_str(&format!(
-                "  • {} → {}.{}({})\n",
-                fk.column, fk.ref_schema, fk.ref_table, fk.ref_column
-            ));
-        }
-    }
-
-    if let Some(def) = &detail.view_definition {
-        out.push_str(&format!("\n[VIEW] Definición:\n{def}\n"));
-    } else {
-        // None is ambiguous: base table OR view hidden by a missing VIEW
-        // DEFINITION grant. Never stay silent so the LLM does not misread
-        // absence as "not a view".
-        out.push_str("\n[VIEW] Definición: definition unavailable (permissions) — base table or missing VIEW DEFINITION grant.\n");
-    }
-
-    out.push_str(&format!(
-        "\nMUESTRA (TOP 5, {} filas):\n",
-        detail.sample_rows.len()
-    ));
-    if detail.sample_rows.is_empty() {
-        out.push_str("  (sin filas)\n");
-    } else {
-        for (idx, row) in detail.sample_rows.iter().enumerate() {
-            if let Some(obj) = row.as_object() {
-                let cells: Vec<String> = obj
-                    .iter()
-                    .map(|(k, v)| {
-                        let display = if is_sensitive_column(k) {
-                            "[REDACTED]".to_string()
-                        } else {
-                            format_cell_value(v)
-                        };
-                        format!("{k} = {display}")
-                    })
-                    .collect();
-                out.push_str(&format!("  Fila {}: {}\n", idx + 1, cells.join(", ")));
-            } else {
-                out.push_str(&format!("  Fila {}: {row}\n", idx + 1));
-            }
-        }
-    }
-
-    // Row count -1 means unknown (bounded COUNT timed out or failed);
-    // structure/sample above are still complete, so report unknown explicitly.
-    if detail.row_count < 0 {
-        out.push_str(
-            "\nCOUNT(*): unknown (COUNT capped/timed out — structure above is complete)\n",
-        );
-    } else {
-        out.push_str(&format!("\nCOUNT(*): {}\n", detail.row_count));
-    }
-    out.push_str(
-        "\n→ IMPORTANTE: Esto incluye ESTRUCTURA y MUESTRA. \
-         Para más DATOS usa execute_read_query con un SELECT.",
-    );
-    out
-}
-
-pub fn format_invalid_reinject(candidates: &[TableInfo], error_msg: &str) -> String {
-    let mut out = format!("❌ Invalid object name: {}\n", error_msg);
-    out.push_str("→ La tabla no existe. Usa solo nombres calificados de search_schema.\n");
-    out.push_str("Candidatos disponibles (17 máx):\n");
-    for t in candidates.iter().take(17) {
-        out.push_str(&format!("  • {}.{}\n", t.schema, t.table));
-    }
-    if candidates.is_empty() {
-        out.push_str("  (no hay candidatos visibles)\n");
-    }
-    out.push_str(
-        "→ Corrige el SQL usando un nombre de la lista y reintenta dentro de MAX_STEPS.\n",
-    );
-    out
-}
-
-/// Max tables grounded into schema memory per search tool call.
-/// Bounds the old fan-out (one describe per match) now replaced by data reuse.
-pub const MEMORY_GROUNDING_LIMIT: usize = 5;
-
-/*
- * ====================================================================
- * LOOP GUARD: bounded hints + same-call dedup
- * ====================================================================
- */
-
-/// Max schema-memory hints injected into the system prompt per turn.
-pub const MAX_HINTS: usize = 8;
-/// Max total chars of injected schema hints per turn.
-pub const MAX_HINT_CHARS: usize = 2000;
-
-/// Marker appended when hints are trimmed by count or char budget.
-pub const HINT_TRUNCATION_MARKER: &str = "\n…[hints truncated]";
-
-/// Build the bounded schema-hint text from memory.
-/// Keeps the most-recently-used valid (unexpired) entries up to 8 hints /
-/// 2000 chars; appends a truncation marker when trimmed.
-pub fn build_schema_hint_text(memory: &SchemaMemory) -> String {
-    let mut entries: Vec<_> = memory.iter().filter(|(_, e)| !e.is_expired()).collect();
-    entries.sort_by_key(|(_, e)| std::cmp::Reverse(e.last_used));
-    let trimmed_by_count = entries.len() > MAX_HINTS;
-    let lines: Vec<String> = entries
-        .into_iter()
-        .take(MAX_HINTS)
-        .map(|(k, e)| {
-            format!(
-                "{} -> {}.{} (synonyms: {})",
-                k,
-                e.table.schema,
-                e.table.table,
-                e.synonyms.join(", ")
-            )
-        })
-        .collect();
-    let mut out = lines.join("\n");
-    let mut truncated = trimmed_by_count;
-    if out.len() > MAX_HINT_CHARS {
-        let mut end = MAX_HINT_CHARS.min(out.len());
-        while end > 0 && !out.is_char_boundary(end) {
-            end -= 1;
-        }
-        out.truncate(end);
-        truncated = true;
-    }
-    if truncated {
-        out.push_str(HINT_TRUNCATION_MARKER);
-    }
-    out
-}
-
-/// Stable per-turn dedup key: tool name + NUL + canonical args JSON.
-pub fn dedup_key(tool: &str, args: &Value) -> String {
-    format!(
-        "{tool}\0{}",
-        serde_json::to_string(args).unwrap_or_default()
-    )
-}
-
-/// Group column matches by table (deduped, at most `limit` tables) and convert
-/// the already-fetched match rows into memory columns — zero DB calls.
-/// Nullable defaults to true (conservative) and ordinal to 0 (unknown); full
-/// column lists still arrive via `describe_table`, which overwrites these.
-pub fn memory_columns_for_column_matches(
-    matches: &[ColumnMatch],
-    limit: usize,
-) -> Vec<(String, TableInfo, Vec<ColumnInfo>)> {
-    use std::collections::HashMap;
-    let mut grouped: HashMap<String, (TableInfo, Vec<ColumnInfo>)> = HashMap::new();
-    let mut order: Vec<String> = Vec::new();
-    for m in matches {
-        if grouped.len() >= limit && !grouped.contains_key(&format!("{}.{}", m.schema, m.table)) {
-            continue;
-        }
-        let key = format!("{}.{}", m.schema, m.table);
-        let entry = grouped.entry(key.clone()).or_insert_with(|| {
-            order.push(key.clone());
-            (
-                TableInfo {
-                    schema: m.schema.clone(),
-                    table: m.table.clone(),
-                    table_type: String::new(),
-                },
-                Vec::new(),
-            )
-        });
-        if !entry.1.iter().any(|c| c.column == m.column) {
-            entry.1.push(ColumnInfo {
-                column: m.column.clone(),
-                data_type: m.data_type.clone(),
-                nullable: true,
-                ordinal: 0,
-            });
-        }
-    }
-    order
-        .into_iter()
-        .filter_map(|k| grouped.remove(&k).map(|(t, c)| (k, t, c)))
-        .collect()
-}
-
-/// Ground schema memory from already-fetched column matches (no DB calls).
-/// Merge-safe: existing entries keep their full column list and only gain
-/// missing matched columns plus the new synonym; new tables store the partial
-/// matched columns until `describe_table` grounds them fully.
-pub fn ground_memory_from_column_matches(
-    memory: &mut SchemaMemory,
-    matches: &[ColumnMatch],
-    query: &str,
-    ttl_seconds: u64,
-) {
-    for (key, tbl, cols) in memory_columns_for_column_matches(matches, MEMORY_GROUNDING_LIMIT) {
-        if let Some(existing) = memory.get_mut(&key) {
-            existing.last_used = chrono::Utc::now();
-            existing.hit_count += 1;
-            if !existing.synonyms.contains(&query.to_string()) {
-                existing.synonyms.push(query.to_string());
-            }
-            for c in cols {
-                if !existing.columns.iter().any(|e| e.column == c.column) {
-                    existing.columns.push(c);
-                }
-            }
-            existing.ttl_seconds = ttl_seconds;
-        } else {
-            upsert_schema_memory(memory, key, tbl, cols, Some(query.to_string()), ttl_seconds);
-        }
-    }
-}
-
-/// Pure ranking helper used by `search_schema` and tests.
-/// Returns ranked matches after AND→OR fallback, truncated to `max_results`.
-/// For empty query, returns first `max_results` tables (no ranking).
-pub fn filter_and_rank_tables(
-    query: &str,
-    tables: &[TableInfo],
-    max_results: usize,
-) -> Vec<TableInfo> {
-    let (ranked, _) = search_with_fallback(query, tables, max_results);
-    ranked
-}
-
-/// Score helper shared by every ranking phase (single-term vs multi-term).
-fn rank_score(terms: &[String], norm_query_joined: &str, norm_table: &str) -> usize {
-    if terms.len() == 1 {
-        levenshtein(norm_query_joined, norm_table)
-    } else {
-        terms
-            .iter()
-            .map(|term| levenshtein(term, norm_table))
-            .min()
-            .unwrap_or(usize::MAX)
-    }
-}
-
-/// Core ranking over precomputed normalized names with an allowlist mask.
-/// Returns (matched, suggestion, top_suggestions): the zero-hit full ranking is
-/// computed ONCE here, so callers reuse `top_suggestions` instead of re-ranking.
-/// Only matched/suggested entries are cloned (never the full table Vec).
-/// `allowed[i] == false` skips `tables[i]`; `None` means every entry is allowed.
-pub fn search_with_fallback_masked(
-    query: &str,
-    tables: &[TableInfo],
-    norm: &[NormalizedEntry],
-    allowed: Option<&[bool]>,
-    max_results: usize,
-) -> (Vec<TableInfo>, Option<TableInfo>, Vec<TableInfo>) {
-    debug_assert_eq!(tables.len(), norm.len());
-    let q = query.trim();
-    if q.is_empty() {
-        let ranked: Vec<TableInfo> = tables
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| allowed.is_none_or(|m| m[*i]))
-            .take(max_results)
-            .map(|(_, t)| t.clone())
-            .collect();
-        return (ranked, None, Vec::new());
-    }
-    let terms: Vec<String> = q.split_whitespace().map(normalize_term).collect();
-    let norm_query_joined = terms.join(" ");
-    let is_allowed = |i: usize| allowed.is_none_or(|m| m[i]);
-
-    // AND phase (indices only; clone after truncate)
-    let mut and_matches: Vec<(usize, usize)> = Vec::new();
-    for (i, n) in norm.iter().enumerate() {
-        if !is_allowed(i) {
-            continue;
-        }
-        let all_contain = terms
-            .iter()
-            .all(|term| n.norm_full.contains(term) || n.norm_table.contains(term));
-        if all_contain {
-            and_matches.push((i, rank_score(&terms, &norm_query_joined, &n.norm_table)));
-        }
-    }
-    if !and_matches.is_empty() {
-        and_matches.sort_by(|a, b| {
-            a.1.cmp(&b.1)
-                .then_with(|| tables[a.0].table.cmp(&tables[b.0].table))
-        });
-        let out: Vec<TableInfo> = and_matches
-            .into_iter()
-            .take(max_results)
-            .map(|(i, _)| tables[i].clone())
-            .collect();
-        return (out, None, Vec::new());
-    }
-
-    // OR phase
-    let mut or_matches: Vec<(usize, usize)> = Vec::new();
-    for (i, n) in norm.iter().enumerate() {
-        if !is_allowed(i) {
-            continue;
-        }
-        let any_contain = terms
-            .iter()
-            .any(|term| n.norm_full.contains(term) || n.norm_table.contains(term));
-        if any_contain {
-            or_matches.push((i, rank_score(&terms, &norm_query_joined, &n.norm_table)));
-        }
-    }
-    if !or_matches.is_empty() {
-        or_matches.sort_by(|a, b| {
-            a.1.cmp(&b.1)
-                .then_with(|| tables[a.0].table.cmp(&tables[b.0].table))
-        });
-        let out: Vec<TableInfo> = or_matches
-            .into_iter()
-            .take(max_results)
-            .map(|(i, _)| tables[i].clone())
-            .collect();
-        return (out, None, Vec::new());
-    }
-
-    // Zero matches → Did-you-mean: single ranking pass yields both the closest
-    // suggestion and the truncated top list, so callers never re-rank.
-    let mut all_ranked: Vec<(usize, usize)> = norm
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| is_allowed(*i))
-        .map(|(i, n)| (i, levenshtein(&norm_query_joined, &n.norm_table)))
-        .collect();
-    all_ranked.sort_by(|a, b| {
-        a.1.cmp(&b.1)
-            .then_with(|| tables[a.0].table.cmp(&tables[b.0].table))
-    });
-    let suggestion = all_ranked.first().map(|(i, _)| tables[*i].clone());
-    let top: Vec<TableInfo> = all_ranked
-        .iter()
-        .take(max_results)
-        .map(|(i, _)| tables[*i].clone())
-        .collect();
-    // Return empty ranked but with suggestion; caller will format 0 + Did-you-mean
-    (Vec::new(), suggestion, top)
-}
-
-/// Ranking over precomputed normalized names (single pass, no per-call normalize).
-pub fn search_with_fallback_precomputed(
-    query: &str,
-    tables: &[TableInfo],
-    norm: &[NormalizedEntry],
-    max_results: usize,
-) -> (Vec<TableInfo>, Option<TableInfo>) {
-    let (matched, suggestion, _) =
-        search_with_fallback_masked(query, tables, norm, None, max_results);
-    (matched, suggestion)
-}
-
-/// Returns (ranked_matches, did_you_mean) where `did_you_mean` is Some(closest)
-/// when no matches were found (for Did-you-mean suggestion). When query is empty,
-/// `did_you_mean` is None and `ranked` is truncated list.
-/// Compat wrapper: precomputes normalized names once, then delegates to the
-/// masked core so ordering matches `search_with_fallback_precomputed` exactly.
-pub fn search_with_fallback(
-    query: &str,
-    tables: &[TableInfo],
-    max_results: usize,
-) -> (Vec<TableInfo>, Option<TableInfo>) {
-    let norm = precompute_normalized(tables);
-    search_with_fallback_precomputed(query, tables, &norm, max_results)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::TableInfo;
-
-    fn make_tables(names: &[(&str, &str)]) -> Vec<TableInfo> {
-        names
-            .iter()
-            .map(|(s, t)| TableInfo {
-                schema: s.to_string(),
-                table: t.to_string(),
-                table_type: "BASE TABLE".to_string(),
-            })
-            .collect()
-    }
-
-    #[test]
-    fn singularize_usuarios() {
-        assert_eq!(singularize("usuarios"), "usuario");
-    }
-
-    #[test]
-    fn singularize_roles() {
-        assert_eq!(singularize("roles"), "rol");
-    }
-
-    #[test]
-    fn singularize_meses() {
-        // "meses" -> "mes" via es removal
-        assert_eq!(singularize("meses"), "mes");
-    }
-
-    #[test]
-    fn strip_accents_cancion() {
-        assert_eq!(strip_accents("canción"), "cancion");
-    }
-
-    #[test]
-    fn strip_accents_espanol() {
-        assert_eq!(strip_accents("español"), "espanol");
-    }
-
-    #[test]
-    fn levenshtein_kitten_sitting() {
-        assert_eq!(levenshtein("kitten", "sitting"), 3);
-    }
-
-    #[test]
-    fn levenshtein_usuarios_usuario() {
-        // "usuarios" vs "usuario" distance 1 (extra s)
-        assert_eq!(levenshtein("usuarios", "usuario"), 1);
-    }
-
-    #[test]
-    fn normalize_term_usuarios() {
-        assert_eq!(normalize_term("Usuarios"), "usuario");
-    }
-
-    #[test]
-    fn normalize_term_with_accent() {
-        assert_eq!(normalize_term("Canciones"), "cancion");
-    }
-
-    #[test]
-    fn search_rank_usuarios_finds_usuario_first() {
-        let tables = make_tables(&[("dbo", "Usuario"), ("dbo", "Producto"), ("dbo", "Pedido")]);
-        let ranked = filter_and_rank_tables("usuarios", &tables, 20);
-        assert!(!ranked.is_empty(), "should find at least one");
-        assert_eq!(ranked[0].table, "Usuario");
-    }
-
-    #[test]
-    fn search_or_fallback_finds_partial() {
-        let tables = make_tables(&[("dbo", "Usuario"), ("dbo", "Producto")]);
-        // query "usu prod" AND would require both terms in same table -> 0, OR should find both
-        let ranked = filter_and_rank_tables("usu prod", &tables, 20);
-        // With OR fallback, should find both tables (each matches one term)
-        assert_eq!(ranked.len(), 2);
-    }
-
-    #[test]
-    fn search_zero_returns_did_you_mean_candidates() {
-        let tables = make_tables(&[("dbo", "Usuario"), ("dbo", "Producto")]);
-        let (ranked, did_you_mean) = search_with_fallback("xyz_noexiste", &tables, 20);
-        assert!(ranked.is_empty(), "no direct match");
-        assert!(did_you_mean.is_some(), "should suggest Did you mean");
-        let dm = did_you_mean.unwrap();
-        assert!(
-            dm.table == "Usuario" || dm.table == "Producto",
-            "Did you mean should be one of the candidates, got {}",
-            dm.table
-        );
-    }
-
-    #[test]
-    fn search_truncates_to_max_k() {
-        let mut names = Vec::new();
-        for i in 0..30 {
-            names.push(("dbo".to_string(), format!("Tabla{i:02}")));
-        }
-        // Convert to &[(&str,&str)] not easy, so build tables directly
-        let tables: Vec<TableInfo> = (0..30)
-            .map(|i| TableInfo {
-                schema: "dbo".into(),
-                table: format!("Tabla{i:02}"),
-                table_type: "BASE TABLE".into(),
-            })
-            .collect();
-        let ranked = filter_and_rank_tables("", &tables, 20);
-        assert_eq!(ranked.len(), 20, "should truncate to MAX_SCHEMA_RESULTS 20");
-    }
-
-    #[test]
-    fn split_table_defaults_to_dbo() {
-        let (schema, table) = split_table_pub("usuarios");
-        assert_eq!(schema, "dbo");
-        assert_eq!(table, "usuarios");
-    }
-
-    #[test]
-    fn split_table_with_schema_keeps_schema() {
-        let (s, t) = split_table_pub("dbo.Usuario");
-        assert_eq!(s, "dbo");
-        assert_eq!(t, "Usuario");
-        let (s2, t2) = split_table_pub("[dbo].[Usuario]");
-        assert_eq!(s2, "dbo");
-        assert_eq!(t2, "Usuario");
-    }
-
-    #[test]
-    fn split_table_matches_shared_helper() {
-        // P2: agent split_table must stay equivalent to the shared helper
-        // (warn-only difference on missing schema).
-        for input in [
-            "dbo.Usuario",
-            "[dbo].[Usuario]",
-            "\"dbo\".\"Usuario\"",
-            "usuarios",
-            "db.dbo.Usuario",
-        ] {
-            assert_eq!(
-                split_table_pub(input),
-                crate::util::split_table_name(input),
-                "mismatch for {input}"
-            );
-        }
-    }
-
-    #[test]
-    fn format_cell_value_matches_both_row_paths() {
-        // P2: the extracted helper must render exactly what both inline
-        // matches rendered before the fusion.
-        assert_eq!(format_cell_value(&Value::Null), "[NULL]");
-        assert_eq!(format_cell_value(&serde_json::json!(42)), "42");
-        assert_eq!(format_cell_value(&serde_json::json!("hola")), "hola");
-        assert_eq!(format_cell_value(&serde_json::json!(true)), "true");
-        assert_eq!(format_cell_value(&serde_json::json!({"a": 1})), "[complex]");
-        assert_eq!(format_cell_value(&serde_json::json!([1, 2])), "[complex]");
-    }
-
-    #[test]
-    fn format_invalid_reinject_contains_candidates() {
-        let tables = make_tables(&[("dbo", "Usuario"), ("dbo", "Producto")]);
-        let msg = format_invalid_reinject(&tables, "Invalid object name 'dbo.usuarios'");
-        assert!(msg.contains("Invalid object name"));
-        assert!(msg.contains("dbo.Usuario"));
-        assert!(msg.contains("dbo.Producto"));
-        assert!(msg.contains("17 máx") || msg.contains("Candidatos"));
-    }
-
-    #[test]
-    fn format_invalid_reinject_limits_to_17() {
-        let tables: Vec<TableInfo> = (0..30)
-            .map(|i| TableInfo {
-                schema: "dbo".into(),
-                table: format!("Tabla{i:02}"),
-                table_type: "BASE TABLE".into(),
-            })
-            .collect();
-        let msg = format_invalid_reinject(&tables, "Invalid object name 'dbo.foo'");
-        // Should contain only first 17
-        assert!(msg.contains("Tabla00"));
-        assert!(msg.contains("Tabla16"));
-        assert!(!msg.contains("Tabla17"), "should limit to 17 candidates");
-    }
-
-    // ===== Task 2.4 discovery formatters (SG-1/SG-2) =====
-    use crate::database::schema::{ColumnMatch, ForeignKeyInfo, TableDetail};
-
-    fn sample_tables_with_types() -> Vec<TableInfo> {
-        vec![
-            TableInfo {
-                schema: "dbo".into(),
-                table: "Orders".into(),
-                table_type: "BASE TABLE".into(),
-            },
-            TableInfo {
-                schema: "dbo".into(),
-                table: "VwActive".into(),
-                table_type: "VIEW".into(),
-            },
-        ]
-    }
-
-    #[test]
-    fn format_table_list_shows_schema_and_type() {
-        let out = format_table_list(&sample_tables_with_types());
-        assert!(out.contains("dbo.Orders"), "got: {out}");
-        assert!(out.contains("BASE TABLE"), "got: {out}");
-        assert!(out.contains("dbo.VwActive"), "got: {out}");
-        assert!(out.contains("VIEW"), "got: {out}");
-    }
-
-    #[test]
-    fn format_table_list_empty_warns_without_guessing() {
-        let out = format_table_list(&[]);
-        assert!(out.contains('0'), "got: {out}");
-        assert!(
-            out.to_lowercase().contains("no inventes") || out.to_lowercase().contains("no hay"),
-            "empty list must warn against inventing names, got: {out}"
-        );
-    }
-
-    #[test]
-    fn format_column_matches_returns_table_column_pairs() {
-        let matches = vec![ColumnMatch {
-            schema: "dbo".into(),
-            table: "Orders".into(),
-            column: "email".into(),
-            data_type: "nvarchar".into(),
-        }];
-        let out = format_column_matches(&matches, "email");
-        assert!(out.contains("dbo.Orders"), "got: {out}");
-        assert!(out.contains("email"), "got: {out}");
-    }
-
-    #[test]
-    fn format_column_matches_empty_suggests_discovery() {
-        let out = format_column_matches(&[], "zzz_noexiste");
-        assert!(out.contains("zzz_noexiste"), "got: {out}");
-        assert!(
-            out.contains("list_tables"),
-            "no-match must point back to discovery, got: {out}"
-        );
-    }
-
-    fn sample_detail() -> (String, String, TableDetail) {
-        use serde_json::json;
-        (
-            "dbo".into(),
-            "Orders".into(),
-            TableDetail {
-                columns: vec![crate::database::ColumnInfo {
-                    column: "id".into(),
-                    data_type: "int".into(),
-                    nullable: false,
-                    ordinal: 1,
-                }],
-                primary_keys: vec!["id".into()],
-                foreign_keys: vec![ForeignKeyInfo {
-                    column: "user_id".into(),
-                    ref_schema: "dbo".into(),
-                    ref_table: "Usuario".into(),
-                    ref_column: "id".into(),
-                }],
-                view_definition: None,
-                sample_rows: vec![json!({"id": 1})],
-                row_count: 42,
-            },
-        )
-    }
-
-    #[test]
-    fn format_table_detail_full_table_sections() {
-        let (s, t, d) = sample_detail();
-        let out = format_table_detail(&s, &t, &d);
-        assert!(out.contains("ESTRUCTURA"), "got: {out}");
-        assert!(
-            out.contains("PRIMARY KEY") || out.contains("id"),
-            "got: {out}"
-        );
-        assert!(
-            out.contains("dbo.Usuario"),
-            "FK target must appear, got: {out}"
-        );
-        assert!(out.contains("42"), "COUNT(*) must appear, got: {out}");
-        assert!(out.contains("MUESTRA"), "got: {out}");
-    }
-
-    #[test]
-    fn format_table_detail_view_and_empty() {
-        let d = TableDetail {
-            columns: vec![],
-            primary_keys: vec![],
-            foreign_keys: vec![],
-            view_definition: Some("SELECT id FROM dbo.Orders".into()),
-            sample_rows: vec![],
-            row_count: 0,
-        };
-        let out = format_table_detail("dbo", "VwEmpty", &d);
-        assert!(out.contains("VIEW"), "view marker must appear, got: {out}");
-        assert!(
-            out.contains("SELECT id FROM dbo.Orders"),
-            "view definition must appear, got: {out}"
-        );
-        assert!(out.contains('0'), "zero count must appear, got: {out}");
-    }
-
-    #[test]
-    fn format_table_detail_none_definition_shows_permissions_hint() {
-        // Views without VIEW DEFINITION grant arrive with None; the formatter
-        // must hint instead of staying silent.
-        let d = TableDetail {
-            columns: vec![],
-            primary_keys: vec![],
-            foreign_keys: vec![],
-            view_definition: None,
-            sample_rows: vec![],
-            row_count: 10,
-        };
-        let out = format_table_detail("dbo", "VwHidden", &d);
-        assert!(
-            out.contains("definition unavailable (permissions)"),
-            "missing definition must hint permissions, got: {out}"
-        );
-    }
-
-    #[test]
-    fn format_table_detail_unknown_count_still_shows_structure() {
-        // Bounded COUNT timeout yields row_count -1; structure must survive.
-        let (s, t, mut d) = sample_detail();
-        d.row_count = -1;
-        let out = format_table_detail(&s, &t, &d);
-        assert!(
-            out.contains("ESTRUCTURA"),
-            "structure must survive, got: {out}"
-        );
-        assert!(
-            out.contains("MUESTRA"),
-            "sample section must survive, got: {out}"
-        );
-        assert!(
-            out.contains("unknown"),
-            "unknown count must be explicit, got: {out}"
-        );
-    }
 
     #[tokio::test]
     async fn search_columns_data_rejects_empty_query_without_db() {
@@ -2048,40 +820,50 @@ mod tests {
     // ===== Task 2.4 run_with_history helpers =====
     fn dummy_config() -> crate::config::Config {
         crate::config::Config {
-            database_host: "localhost".into(),
-            database_port: 1433,
-            database_name: "TestDB".into(),
-            database_user: "user".into(),
-            database_password: "pass".into(),
-            database_trust_cert: true,
-            llm_provider: "ollama".into(),
-            llm_model: String::new(),
-            llm_api_key: String::new(),
-            llm_base_url: String::new(),
-            ollama_url: "http://127.0.0.1:11434".into(),
-            ollama_model: "qwen3:4b".into(),
-            ollama_timeout_seconds: 120,
-            ollama_connect_timeout_seconds: 5,
-            ollama_temperature: 0.0,
-            max_steps: 8,
-            max_sql_length: 10_000,
-            max_rows: 100,
-            schema_cache_seconds: 300,
-            query_timeout_seconds: 30,
-            max_concurrent_queries: 1,
-            max_joins: 5,
-            max_subqueries: 5,
-            max_schema_results: 20,
-            max_tool_result_chars: 20_000,
-            max_tool_calls_per_step: 10,
-            allowed_tables: vec![],
-            block_sensitive_columns: true,
-            block_comments: true,
-            allow_cte: true,
-            allow_system_tables: false,
-            audit_enabled: false,
-            audit_path: "logs/test-audit.jsonl".into(),
-            audit_sql: false,
+            db: crate::config::DbConfig {
+                host: "localhost".into(),
+                port: 1433,
+                name: "TestDB".into(),
+                user: "user".into(),
+                password: "pass".into(),
+                trust_cert: true,
+            },
+            llm: crate::config::LlmConfig {
+                provider: "ollama".into(),
+                model: String::new(),
+                api_key: String::new(),
+                base_url: String::new(),
+                ollama_url: "http://127.0.0.1:11434".into(),
+                ollama_model: "qwen3:4b".into(),
+                timeout_s: 120,
+                connect_timeout_s: 5,
+                temperature: 0.0,
+            },
+            policy: crate::config::PolicyConfig {
+                allowed_tables: vec![],
+                block_sensitive_columns: true,
+                block_comments: true,
+                allow_cte: true,
+                allow_system_tables: false,
+            },
+            limits: crate::config::LimitsConfig {
+                max_steps: 8,
+                max_sql_length: 10_000,
+                max_rows: 100,
+                schema_cache_s: 300,
+                query_timeout_s: 30,
+                max_concurrent_queries: 1,
+                max_joins: 5,
+                max_subqueries: 5,
+                max_schema_results: 20,
+                max_tool_result_chars: 20_000,
+                max_tool_calls_per_step: 10,
+            },
+            audit: crate::config::AuditConfig {
+                enabled: false,
+                path: "logs/test-audit.jsonl".into(),
+                capture_sql: false,
+            },
             verbose: false,
         }
     }
@@ -2282,287 +1064,70 @@ mod tests {
         assert!(res.is_err());
     }
 
-    // ===== P1a-6 dispatch data reuse (same formats, fewer DB calls) =====
-    use std::collections::HashMap;
+    // ===== slice D step 2: unified-dispatch parity (lock-in guard) =====
+    // Same tool-call input through the unified dispatcher with and without a
+    // session must produce identical output; the session path additionally
+    // grounds memory. The pre-unification probe showed both twin paths already
+    // agreed on outputs (divergence was session side-effects only), so this
+    // guard pins the fused behavior. Only DB-free arms run here; DB-touching
+    // arms share the same callees on both paths by construction.
+    #[tokio::test]
+    async fn dispatch_unified_parity_none_vs_session() {
+        use crate::llm::{ToolCall, ToolFunction};
 
-    fn column_matches_for_memory_test() -> Vec<ColumnMatch> {
-        vec![
-            ColumnMatch {
-                schema: "dbo".into(),
-                table: "Orders".into(),
-                column: "email".into(),
-                data_type: "nvarchar".into(),
-            },
-            ColumnMatch {
-                schema: "dbo".into(),
-                table: "Orders".into(),
-                column: "id".into(),
-                data_type: "int".into(),
-            },
-            ColumnMatch {
-                schema: "dbo".into(),
-                table: "Usuario".into(),
-                column: "email".into(),
-                data_type: "nvarchar".into(),
-            },
-        ]
-    }
-
-    #[test]
-    fn memory_columns_dedupes_tables_and_bounds_to_five() {
-        // 12 matches across 7 tables -> at most 5 tables, first-seen order kept.
-        let matches: Vec<ColumnMatch> = (0..12)
-            .map(|i| ColumnMatch {
-                schema: "dbo".into(),
-                table: format!("Tabla{i:02}"),
-                column: "email".into(),
-                data_type: "nvarchar".into(),
-            })
-            .collect();
-        let grouped = memory_columns_for_column_matches(&matches, MEMORY_GROUNDING_LIMIT);
-        assert_eq!(
-            grouped.len(),
-            MEMORY_GROUNDING_LIMIT,
-            "fan-out must stay bounded"
-        );
-        assert_eq!(grouped[0].1.table, "Tabla00");
-        assert_eq!(grouped[4].1.table, "Tabla04");
-        // Duplicates collapse into one table entry with both columns.
-        let dupes = column_matches_for_memory_test();
-        let grouped = memory_columns_for_column_matches(&dupes, MEMORY_GROUNDING_LIMIT);
-        assert_eq!(grouped.len(), 2, "Orders+Usuario deduped, got {grouped:?}");
-        let orders = grouped
-            .iter()
-            .find(|(_, t, _)| t.table == "Orders")
-            .unwrap();
-        assert_eq!(orders.2.len(), 2, "both Orders columns reused");
-        // Same format input preserved for the LLM formatter.
-        let out = format_column_matches(&dupes, "email");
-        assert!(out.contains("dbo.Orders.email") && out.contains("dbo.Usuario.email"));
-    }
-
-    #[test]
-    fn ground_memory_reuses_matches_with_zero_db_calls() {
-        // Simple call counter stands in for DB describes: the old path called
-        // describe once per match (up to 5); the new path calls zero.
-        struct CallCounter {
-            calls: usize,
-        }
-        impl CallCounter {
-            fn old_path_describe(&mut self, matches: &[ColumnMatch]) {
-                for _ in matches.iter().take(5) {
-                    self.calls += 1;
-                }
+        fn call(name: &str, args: serde_json::Value) -> ToolCall {
+            ToolCall {
+                id: None,
+                function: ToolFunction {
+                    name: name.to_string(),
+                    arguments: args,
+                },
             }
         }
-        let matches = column_matches_for_memory_test();
-        let mut counter = CallCounter { calls: 0 };
-        counter.old_path_describe(&matches);
-        assert_eq!(counter.calls, 3, "old path hit DB per match");
 
-        let new_calls = 0; // ground_memory_from_column_matches takes no DB handle
-        let mut memory: crate::database::schema::SchemaMemory = HashMap::new();
-        ground_memory_from_column_matches(&mut memory, &matches, "email", 300);
-        assert_eq!(new_calls, 0);
-        assert!(new_calls < counter.calls, "new path must make fewer calls");
-        assert!(memory.contains_key("dbo.Orders"));
-        assert!(memory.contains_key("dbo.Usuario"));
-        assert_eq!(memory["dbo.Orders"].columns.len(), 2);
-    }
+        let agent = Agent::new(dummy_config());
+        let mut session = crate::agent::session::Session::new();
 
-    #[test]
-    fn ground_memory_merges_without_clobbering_full_columns() {
-        use crate::database::ColumnInfo;
-        let mut memory: crate::database::schema::SchemaMemory = HashMap::new();
-        let tbl = TableInfo {
-            schema: "dbo".into(),
-            table: "Orders".into(),
-            table_type: "BASE TABLE".into(),
-        };
-        // Previously described table holds the full column list.
-        upsert_schema_memory(
-            &mut memory,
-            "dbo.Orders".into(),
-            tbl,
-            vec![
-                ColumnInfo {
-                    column: "id".into(),
-                    data_type: "int".into(),
-                    nullable: false,
-                    ordinal: 1,
-                },
-                ColumnInfo {
-                    column: "total".into(),
-                    data_type: "decimal".into(),
-                    nullable: false,
-                    ordinal: 2,
-                },
-            ],
-            Some("orders".into()),
-            300,
-        );
-        // A later column search reuses its single matched row; full list survives.
-        let matches = vec![ColumnMatch {
-            schema: "dbo".into(),
-            table: "Orders".into(),
-            column: "email".into(),
-            data_type: "nvarchar".into(),
-        }];
-        ground_memory_from_column_matches(&mut memory, &matches, "email", 300);
-        let cols: Vec<&str> = memory["dbo.Orders"]
-            .columns
-            .iter()
-            .map(|c| c.column.as_str())
-            .collect();
-        assert!(
-            cols.contains(&"id") && cols.contains(&"total"),
-            "full list kept"
-        );
-        assert!(cols.contains(&"email"), "matched column merged");
-    }
+        // Every case below resolves without touching the DB.
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            // Policy-blocked SQL short-circuits before audit/DB.
+            (
+                "execute_read_query",
+                serde_json::json!({"sql": "DELETE FROM dbo.Usuario"}),
+            ),
+            // Missing-arg bails precede any DB call.
+            ("execute_read_query", serde_json::json!({"sql": ""})),
+            ("execute_read_query", serde_json::json!({})),
+            ("describe_table", serde_json::json!({"table": ""})),
+            ("search_columns", serde_json::json!({"query": ""})),
+            ("search_columns", serde_json::json!({})),
+            // Unknown tool never reaches the DB.
+            ("herramienta_fantasma", serde_json::json!({})),
+        ];
 
-    #[test]
-    fn describe_reuses_detail_columns_for_memory() {
-        // Pins P1a-6: memory columns ARE the TableDetail columns from the single
-        // describe_table_full fetch — no second describe_table call exists.
-        let (_, _, detail) = sample_detail();
-        let cols_for_memory: Vec<crate::database::ColumnInfo> = detail.columns.clone();
-        assert_eq!(cols_for_memory.len(), 1);
-        assert_eq!(cols_for_memory[0].column, "id");
-        let out = format_table_detail("dbo", "Orders", &detail);
-        assert!(out.contains("ESTRUCTURA") && out.contains("MUESTRA"));
-    }
-
-    // ===== P1a-7 ranking: same order/suggestion, precomputed + single pass =====
-    #[test]
-    fn precomputed_ranking_matches_legacy_order_and_suggestion() {
-        let tables = make_tables(&[
-            ("dbo", "Usuario"),
-            ("dbo", "Producto"),
-            ("dbo", "Pedido"),
-            ("dbo", "UsuarioDireccion"),
-        ]);
-        for query in ["usuarios", "usu prod", "xyz_noexiste", "pedido", ""] {
-            let (legacy_matched, legacy_sugg) = search_with_fallback(query, &tables, 20);
-            let norm = precompute_normalized(&tables);
-            let (pre_matched, pre_sugg) =
-                search_with_fallback_precomputed(query, &tables, &norm, 20);
-            let legacy_names: Vec<_> = legacy_matched
-                .iter()
-                .map(|t| format!("{}.{}", t.schema, t.table))
-                .collect();
-            let pre_names: Vec<_> = pre_matched
-                .iter()
-                .map(|t| format!("{}.{}", t.schema, t.table))
-                .collect();
-            assert_eq!(pre_names, legacy_names, "order must match for '{query}'");
-            assert_eq!(
-                pre_sugg.map(|t| t.table),
-                legacy_sugg.map(|t| t.table),
-                "suggestion must match for '{query}'"
-            );
+        for (name, args) in cases {
+            let c = call(name, args);
+            let without = agent.dispatch_tool(&c, "req-parity", None).await;
+            let with = agent
+                .dispatch_tool(&c, "req-parity", Some(&mut session))
+                .await;
+            match (without, with) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(a, b, "dispatch output diverged for tool '{name}'")
+                }
+                (Err(a), Err(b)) => assert_eq!(
+                    a.to_string(),
+                    b.to_string(),
+                    "dispatch error diverged for tool '{name}'"
+                ),
+                (a, b) => panic!("dispatch ok/err diverged for tool '{name}': {a:?} vs {b:?}"),
+            }
         }
-    }
-
-    #[test]
-    fn masked_zero_hit_returns_suggestion_and_top_from_single_pass() {
-        let tables = make_tables(&[("dbo", "Usuario"), ("dbo", "Producto")]);
-        let norm = precompute_normalized(&tables);
-        let (matched, suggestion, top) =
-            search_with_fallback_masked("xyz_noexiste", &tables, &norm, None, 20);
-        assert!(matched.is_empty());
-        let sugg = suggestion.expect("zero-hit must suggest");
-        assert!(!top.is_empty(), "top reuses the same ranking pass");
-        assert_eq!(top[0].table, sugg.table, "suggestion is top[0], no re-rank");
-        // Mask filters without cloning an `allowed` Vec.
-        let mask = vec![true, false];
-        let (masked_matched, _, masked_top) =
-            search_with_fallback_masked("", &tables, &norm, Some(&mask), 20);
-        assert_eq!(masked_matched.len(), 1);
-        assert_eq!(masked_matched[0].table, "Usuario");
-        assert!(masked_top.is_empty(), "empty query has no suggestions");
-    }
-
-    #[test]
-    fn schema_cache_clone_shares_arc_allocation() {
-        let tables = make_tables(&[("dbo", "Usuario")]);
-        let cache = SchemaCache {
-            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
-            normalized: Arc::new(precompute_normalized(&tables)),
-            tables: Arc::new(tables),
-        };
-        let cloned = cache.clone();
+        // Bail-out arms ground nothing: session memory stays empty.
         assert!(
-            Arc::ptr_eq(&cache.tables, &cloned.tables),
-            "snapshot clone must share the table Arc, not copy the Vec"
-        );
-        assert!(
-            Arc::ptr_eq(&cache.normalized, &cloned.normalized),
-            "normalized names must also be shared"
-        );
-        assert_eq!(cloned.normalized.len(), cloned.tables.len());
-    }
-
-    // ===== slice-1a: render redaction (RED) =====
-
-    #[test]
-    fn format_query_result_redacts_sensitive_header() {
-        // Residual leak at render must show [REDACTED], safe cols stay visible.
-        let rows = vec![serde_json::json!({"id": 1, "password": "secret123"})];
-        let out = format_query_result(&rows, false);
-        assert!(
-            out.contains("[REDACTED]"),
-            "sensitive value must be redacted, got: {out}"
-        );
-        assert!(
-            !out.contains("secret123"),
-            "raw sensitive value must never leak, got: {out}"
-        );
-        assert!(
-            out.contains('1'),
-            "safe value must stay visible, got: {out}"
+            session.schema_memory.is_empty(),
+            "unified dispatch must not ground memory on bail-out arms"
         );
     }
 
-    #[test]
-    fn format_query_result_redacts_token_header_case_insensitive() {
-        // Triangulation: different header casing and column (TOKEN family).
-        let rows = vec![serde_json::json!({"MY_TOKEN": "abc", "name": "ana"})];
-        let out = format_query_result(&rows, false);
-        assert!(
-            out.contains("[REDACTED]"),
-            "token header must be redacted, got: {out}"
-        );
-        assert!(
-            !out.contains("abc"),
-            "raw token must never leak, got: {out}"
-        );
-        assert!(
-            out.contains("ana"),
-            "safe value must stay visible, got: {out}"
-        );
-    }
-
-    #[test]
-    fn format_table_detail_redacts_sensitive_sample() {
-        // Describe sample reaching the formatter with a sensitive key
-        // must render [REDACTED] instead of the raw value.
-        let d = TableDetail {
-            columns: vec![],
-            primary_keys: vec![],
-            foreign_keys: vec![],
-            view_definition: None,
-            sample_rows: vec![serde_json::json!({"id": 1, "api_key": "k-123"})],
-            row_count: 1,
-        };
-        let out = format_table_detail("dbo", "Users", &d);
-        assert!(
-            out.contains("[REDACTED]"),
-            "sensitive sample value must be redacted, got: {out}"
-        );
-        assert!(
-            !out.contains("k-123"),
-            "raw sensitive sample must never leak, got: {out}"
-        );
-    }
 }

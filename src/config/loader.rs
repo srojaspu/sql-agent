@@ -1,52 +1,16 @@
+//! Environment / map loading for [`AppConfig`](super::AppConfig).
+//!
+//! Moved verbatim from the pre-split `config.rs`: every environment variable
+//! name, default, deprecated alias, validation message, and drift semantic
+//! is byte-identical. Only the `Ok(Self { … })` construction targets the new
+//! nested sub-structs; every right-hand-side expression is untouched.
+
 use anyhow::{Context, Result};
 
+use super::{AppConfig, AuditConfig, DbConfig, LimitsConfig, LlmConfig, PolicyConfig};
 use crate::util::normalize_table_name;
 
-#[derive(Clone, Debug)]
-pub struct Config {
-    pub database_host: String,
-    pub database_port: u16,
-    pub database_name: String,
-    pub database_user: String,
-    pub database_password: String,
-    pub database_trust_cert: bool,
-
-    pub llm_provider: String,
-    pub llm_model: String,
-    pub llm_api_key: String,
-    pub llm_base_url: String,
-
-    pub ollama_url: String,
-    pub ollama_model: String,
-    pub ollama_timeout_seconds: u64,
-    pub ollama_connect_timeout_seconds: u64,
-    pub ollama_temperature: f32,
-
-    pub max_steps: usize,
-    pub max_sql_length: usize,
-    pub max_rows: usize,
-    pub schema_cache_seconds: u64,
-    pub query_timeout_seconds: u64,
-    pub max_concurrent_queries: usize,
-    pub max_joins: usize,
-    pub max_subqueries: usize,
-    pub max_schema_results: usize,
-    pub max_tool_result_chars: usize,
-    pub max_tool_calls_per_step: usize,
-
-    pub allowed_tables: Vec<String>,
-    pub block_sensitive_columns: bool,
-    pub block_comments: bool,
-    pub allow_cte: bool,
-    pub allow_system_tables: bool,
-
-    pub audit_enabled: bool,
-    pub audit_path: String,
-    pub audit_sql: bool,
-    pub verbose: bool,
-}
-
-impl Config {
+impl AppConfig {
     pub fn from_env() -> Result<Self> {
         let map: std::collections::HashMap<String, String> = std::env::vars().collect();
         Self::from_map(&map)
@@ -74,57 +38,62 @@ impl Config {
         let max_steps_raw = Self::resolve_max_steps_raw(map);
 
         Ok(Self {
-            database_host: get_required(map, "DATABASE_HOST")?,
-            database_port: parse_u16_map(map, "DATABASE_PORT", 1433)?,
-            database_name: get_required(map, "DATABASE_NAME")?,
-            database_user: get_required(map, "DATABASE_USER")?,
-            database_password: get_required(map, "DATABASE_PASSWORD")?,
-            database_trust_cert: parse_bool_map(map, "DATABASE_TRUST_CERT", false)?,
-
-            llm_provider: get_default_map(map, "LLM_PROVIDER", "ollama"),
-            llm_model: get_default_map(map, "LLM_MODEL", ""),
-            llm_api_key: get_default_map(map, "LLM_API_KEY", ""),
-            llm_base_url: get_default_map(map, "LLM_BASE_URL", ""),
-
-            ollama_url: get_default_map(map, "OLLAMA_URL", "http://127.0.0.1:11434"),
-            ollama_model: get_default_map(map, "OLLAMA_MODEL", "qwen3:4b"),
-            ollama_timeout_seconds: parse_u64_map(map, "OLLAMA_TIMEOUT_SECONDS", 120)?,
-            ollama_connect_timeout_seconds: parse_u64_map(
-                map,
-                "OLLAMA_CONNECT_TIMEOUT_SECONDS",
-                5,
-            )?,
-            ollama_temperature: get_default_map(map, "OLLAMA_TEMPERATURE", "0.0")
-                .parse()
-                .context("OLLAMA_TEMPERATURE inválido")?,
-
-            max_steps: if let Some(raw) = max_steps_raw {
-                raw.parse()
-                    .with_context(|| "MAX_STEPS/MAX_AGENT_STEPS inválido")?
-            } else {
-                8
+            db: DbConfig {
+                host: get_required(map, "DATABASE_HOST")?,
+                port: parse_u16_map(map, "DATABASE_PORT", 1433)?,
+                name: get_required(map, "DATABASE_NAME")?,
+                user: get_required(map, "DATABASE_USER")?,
+                password: get_required(map, "DATABASE_PASSWORD")?,
+                trust_cert: parse_bool_map(map, "DATABASE_TRUST_CERT", false)?,
             },
-            max_sql_length: parse_usize_map(map, "MAX_SQL_LENGTH", 10000)?,
-            max_rows: parse_usize_map(map, "MAX_ROWS", 100)?,
-            schema_cache_seconds: parse_u64_map(map, "SCHEMA_CACHE_SECONDS", 300)?,
-            query_timeout_seconds: parse_u64_map(map, "QUERY_TIMEOUT_SECONDS", 30)?,
-            max_concurrent_queries: parse_usize_map(map, "MAX_CONCURRENT_QUERIES", 1)?,
-            max_joins: parse_usize_map(map, "MAX_JOINS", 5)?,
-            max_subqueries: parse_usize_map(map, "MAX_SUBQUERIES", 5)?,
-            max_schema_results: parse_usize_map(map, "MAX_SCHEMA_RESULTS", 20)?,
-            max_tool_result_chars: parse_usize_map(map, "MAX_TOOL_RESULT_CHARS", 20000)?,
-            max_tool_calls_per_step: parse_usize_map(map, "MAX_TOOL_CALLS_PER_STEP", 10)?,
-
-            allowed_tables,
-            block_sensitive_columns: parse_bool_map(map, "BLOCK_SENSITIVE_COLUMNS", true)?,
-            block_comments: parse_bool_map(map, "BLOCK_COMMENTS", true)?,
-            allow_cte: parse_bool_map(map, "ALLOW_CTE", true)?,
-            allow_system_tables: parse_bool_map(map, "ALLOW_SYSTEM_TABLES", false)?,
-
-            audit_enabled: parse_bool_map(map, "AUDIT_ENABLED", true)?,
-            audit_path: get_default_map(map, "AUDIT_PATH", "logs/agent-audit.jsonl"),
-            // Default false: audit SQL text may contain PII; opt in explicitly.
-            audit_sql: parse_bool_map(map, "AUDIT_SQL", false)?,
+            llm: LlmConfig {
+                provider: get_default_map(map, "LLM_PROVIDER", "ollama"),
+                model: get_default_map(map, "LLM_MODEL", ""),
+                api_key: get_default_map(map, "LLM_API_KEY", ""),
+                base_url: get_default_map(map, "LLM_BASE_URL", ""),
+                ollama_url: get_default_map(map, "OLLAMA_URL", "http://127.0.0.1:11434"),
+                ollama_model: get_default_map(map, "OLLAMA_MODEL", "qwen3:4b"),
+                timeout_s: parse_u64_map(map, "OLLAMA_TIMEOUT_SECONDS", 120)?,
+                connect_timeout_s: parse_u64_map(
+                    map,
+                    "OLLAMA_CONNECT_TIMEOUT_SECONDS",
+                    5,
+                )?,
+                temperature: get_default_map(map, "OLLAMA_TEMPERATURE", "0.0")
+                    .parse()
+                    .context("OLLAMA_TEMPERATURE inválido")?,
+            },
+            policy: PolicyConfig {
+                allowed_tables,
+                block_sensitive_columns: parse_bool_map(map, "BLOCK_SENSITIVE_COLUMNS", true)?,
+                block_comments: parse_bool_map(map, "BLOCK_COMMENTS", true)?,
+                allow_cte: parse_bool_map(map, "ALLOW_CTE", true)?,
+                allow_system_tables: parse_bool_map(map, "ALLOW_SYSTEM_TABLES", false)?,
+            },
+            limits: LimitsConfig {
+                max_steps: if let Some(raw) = max_steps_raw {
+                    raw.parse()
+                        .with_context(|| "MAX_STEPS/MAX_AGENT_STEPS inválido")?
+                } else {
+                    8
+                },
+                max_sql_length: parse_usize_map(map, "MAX_SQL_LENGTH", 10000)?,
+                max_rows: parse_usize_map(map, "MAX_ROWS", 100)?,
+                schema_cache_s: parse_u64_map(map, "SCHEMA_CACHE_SECONDS", 300)?,
+                query_timeout_s: parse_u64_map(map, "QUERY_TIMEOUT_SECONDS", 30)?,
+                max_concurrent_queries: parse_usize_map(map, "MAX_CONCURRENT_QUERIES", 1)?,
+                max_joins: parse_usize_map(map, "MAX_JOINS", 5)?,
+                max_subqueries: parse_usize_map(map, "MAX_SUBQUERIES", 5)?,
+                max_schema_results: parse_usize_map(map, "MAX_SCHEMA_RESULTS", 20)?,
+                max_tool_result_chars: parse_usize_map(map, "MAX_TOOL_RESULT_CHARS", 20000)?,
+                max_tool_calls_per_step: parse_usize_map(map, "MAX_TOOL_CALLS_PER_STEP", 10)?,
+            },
+            audit: AuditConfig {
+                enabled: parse_bool_map(map, "AUDIT_ENABLED", true)?,
+                path: get_default_map(map, "AUDIT_PATH", "logs/agent-audit.jsonl"),
+                // Default false: audit SQL text may contain PII; opt in explicitly.
+                capture_sql: parse_bool_map(map, "AUDIT_SQL", false)?,
+            },
             verbose: false,
         })
     }
@@ -264,9 +233,9 @@ impl Config {
             .collect()
     }
 
-    /// Convenience: check self.allowed_tables vs live full names, warn on drift.
+    /// Convenience: check self.policy.allowed_tables vs live full names, warn on drift.
     pub fn drifted_vs_live(&self, live_full_names: &[String]) -> Vec<String> {
-        Self::find_drifted(&self.allowed_tables, live_full_names)
+        Self::find_drifted(&self.policy.allowed_tables, live_full_names)
     }
 }
 
@@ -340,9 +309,9 @@ mod tests {
     #[test]
     fn trust_cert_defaults_to_false() {
         let m = minimal_map();
-        let cfg = Config::from_map(&m).expect("defaults should parse");
+        let cfg = AppConfig::from_map(&m).expect("defaults should parse");
         assert!(
-            !cfg.database_trust_cert,
+            !cfg.db.trust_cert,
             "DATABASE_TRUST_CERT must default to false (explicit dev opt-in only)"
         );
     }
@@ -352,8 +321,8 @@ mod tests {
         let mut m = minimal_map();
         m.insert("LLM_PROVIDER".into(), "anthropic".into());
         m.insert("LLM_API_KEY".into(), "generic-key".into());
-        let cfg = Config::from_map(&m).expect("provider config should parse");
-        assert_eq!(cfg.llm_api_key, "generic-key");
+        let cfg = AppConfig::from_map(&m).expect("provider config should parse");
+        assert_eq!(cfg.llm.api_key, "generic-key");
     }
 
     #[test]
@@ -361,23 +330,23 @@ mod tests {
         let mut m = minimal_map();
         m.insert("LLM_PROVIDER".into(), "openai".into());
         m.insert("OPENAI_API_KEY".into(), "provider-key".into());
-        assert!(Config::from_map(&m).is_err());
+        assert!(AppConfig::from_map(&m).is_err());
     }
 
     #[test]
     fn trust_cert_explicit_dev_override() {
         let mut m = minimal_map();
         m.insert("DATABASE_TRUST_CERT".into(), "true".into());
-        let cfg = Config::from_map(&m).expect("explicit override should parse");
-        assert!(cfg.database_trust_cert);
+        let cfg = AppConfig::from_map(&m).expect("explicit override should parse");
+        assert!(cfg.db.trust_cert);
     }
 
     #[test]
     fn audit_sql_defaults_to_false_pii_safe() {
         let m = minimal_map();
-        let cfg = Config::from_map(&m).expect("defaults should parse");
+        let cfg = AppConfig::from_map(&m).expect("defaults should parse");
         assert!(
-            !cfg.audit_sql,
+            !cfg.audit.capture_sql,
             "AUDIT_SQL must default to false so query text with PII is not persisted"
         );
     }
@@ -386,11 +355,11 @@ mod tests {
     fn blocked_tables_alias_to_allowed_tables() {
         let mut m = minimal_map();
         m.insert("BLOCKED_TABLES".into(), "dbo.foo".into());
-        let cfg = Config::from_map(&m).expect("alias should be accepted");
+        let cfg = AppConfig::from_map(&m).expect("alias should be accepted");
         assert!(
-            cfg.allowed_tables.iter().any(|t| t == "dbo.foo"),
+            cfg.policy.allowed_tables.iter().any(|t| t == "dbo.foo"),
             "BLOCKED_TABLES should populate allowed_tables, got {:?}",
-            cfg.allowed_tables
+            cfg.policy.allowed_tables
         );
     }
 
@@ -398,9 +367,9 @@ mod tests {
     fn blocked_columns_alias_warns_and_maps() {
         let mut m = minimal_map();
         m.insert("BLOCKED_COLUMNS".into(), "dbo.bar".into());
-        let cfg = Config::from_map(&m).expect("BLOCKED_COLUMNS alias should be accepted");
+        let cfg = AppConfig::from_map(&m).expect("BLOCKED_COLUMNS alias should be accepted");
         assert!(
-            cfg.allowed_tables.iter().any(|t| t == "dbo.bar"),
+            cfg.policy.allowed_tables.iter().any(|t| t == "dbo.bar"),
             "BLOCKED_COLUMNS should alias to allowed_tables"
         );
     }
@@ -409,19 +378,19 @@ mod tests {
     fn max_agent_steps_alias() {
         let mut m = minimal_map();
         m.insert("MAX_AGENT_STEPS".into(), "15".into());
-        let cfg = Config::from_map(&m).expect("alias should be accepted");
-        assert_eq!(cfg.max_steps, 15);
+        let cfg = AppConfig::from_map(&m).expect("alias should be accepted");
+        assert_eq!(cfg.limits.max_steps, 15);
     }
 
     #[test]
     fn unknown_var_fails() {
         let mut m = minimal_map();
         m.insert("ALLOWED_TYPO_XYZ".into(), "dbo.foo".into());
-        let res = Config::from_map(&m);
+        let res = AppConfig::from_map(&m);
         assert!(
             res.is_err(),
             "unknown var ALLOWED_TYPO_XYZ should fail, got ok {:?}",
-            res.unwrap().allowed_tables
+            res.unwrap().policy.allowed_tables
         );
         let err = res.unwrap_err().to_string();
         assert!(
@@ -435,13 +404,13 @@ mod tests {
         let mut m = minimal_map();
         m.insert("ALLOWED_TABLES".into(), "dbo.allowed".into());
         m.insert("BLOCKED_TABLES".into(), "dbo.blocked".into());
-        let cfg = Config::from_map(&m).expect("both present should succeed");
+        let cfg = AppConfig::from_map(&m).expect("both present should succeed");
         assert!(
-            cfg.allowed_tables.iter().any(|t| t == "dbo.allowed"),
+            cfg.policy.allowed_tables.iter().any(|t| t == "dbo.allowed"),
             "ALLOWED_TABLES should take precedence"
         );
         assert!(
-            !cfg.allowed_tables.iter().any(|t| t == "dbo.blocked"),
+            !cfg.policy.allowed_tables.iter().any(|t| t == "dbo.blocked"),
             "BLOCKED should not overwrite ALLOWED"
         );
     }
@@ -450,7 +419,7 @@ mod tests {
     fn allowlist_drift_detects_missing() {
         let allowed = vec!["dbo.missing".to_string(), "dbo.existing".to_string()];
         let live = vec!["dbo.existing".to_string(), "dbo.other".to_string()];
-        let drifted = Config::find_drifted(&allowed, &live);
+        let drifted = AppConfig::find_drifted(&allowed, &live);
         assert_eq!(drifted, vec!["dbo.missing"]);
     }
 
@@ -462,7 +431,7 @@ mod tests {
             "dbo.b".to_string(),
             "dbo.c".to_string(),
         ];
-        let drifted = Config::find_drifted(&allowed, &live);
+        let drifted = AppConfig::find_drifted(&allowed, &live);
         assert!(drifted.is_empty(), "no drift expected, got {drifted:?}");
     }
 
@@ -470,7 +439,7 @@ mod tests {
     fn allowlist_empty_allows_all_no_drift() {
         let allowed: Vec<String> = vec![];
         let live = vec!["dbo.a".to_string()];
-        let drifted = Config::find_drifted(&allowed, &live);
+        let drifted = AppConfig::find_drifted(&allowed, &live);
         assert!(drifted.is_empty());
     }
 
@@ -478,7 +447,7 @@ mod tests {
     fn allowlist_drift_case_insensitive() {
         let allowed = vec!["DBO.MISSING".to_string()];
         let live = vec!["dbo.missing".to_string()];
-        let drifted = Config::find_drifted(&allowed, &live);
+        let drifted = AppConfig::find_drifted(&allowed, &live);
         assert!(
             drifted.is_empty(),
             "case-insensitive match should not drift"
