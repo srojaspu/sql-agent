@@ -372,3 +372,72 @@ fn permite_union_todo_autorizado() {
         .validate("SELECT id FROM dbo.entradaLote UNION ALL SELECT id FROM dbo.entradaLote")
         .is_ok());
 }
+
+// ===== slice-1a: AST identifier sensitive check (RED) =====
+
+#[test]
+fn blocks_my_token_identifier() {
+    // Sensitive reference via AST identifier must be blocked with a
+    // sensitive-column error (not allowlist or syntax).
+    let err = v()
+        .validate("SELECT my_token FROM dbo.entradaLote")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.to_lowercase().contains("sensible") || err.to_lowercase().contains("sensitive"),
+        "must fail with sensitive-column error, got: {err}"
+    );
+}
+
+#[test]
+fn blocks_my_token_uppercase_identifier() {
+    // Triangulation: case-insensitive identifier match (different input, same gate).
+    let err = v()
+        .validate("SELECT MY_TOKEN FROM dbo.entradaLote")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.to_lowercase().contains("sensible") || err.to_lowercase().contains("sensitive"),
+        "must fail with sensitive-column error, got: {err}"
+    );
+}
+
+#[test]
+fn allows_password_reset_literal() {
+    // String literal containing sensitive words must not be flagged:
+    // AST identifiers only, literals and comments are ignored.
+    assert!(
+        v().validate("SELECT 'password reset' FROM dbo.entradaLote")
+            .is_ok(),
+        "literal 'password reset' must pass (literals are not identifiers)"
+    );
+}
+
+#[test]
+fn allows_password_reset_literal_in_where() {
+    // Triangulation: literal in a different clause (WHERE) must also pass.
+    assert!(
+        v().validate("SELECT id FROM dbo.entradaLote WHERE note = 'password reset'")
+            .is_ok(),
+        "WHERE literal must pass"
+    );
+}
+
+#[test]
+fn is_sensitive_column_exact_match() {
+    use sql_agent::security::is_sensitive_column;
+    assert!(is_sensitive_column("password"));
+    assert!(is_sensitive_column("PASSWORD"));
+    assert!(is_sensitive_column("[Token]"));
+    assert!(!is_sensitive_column("id"));
+    assert!(!is_sensitive_column("entradaLote"));
+}
+
+#[test]
+fn is_sensitive_column_compound_token_blocked() {
+    use sql_agent::security::is_sensitive_column;
+    assert!(
+        is_sensitive_column("my_token"),
+        "compound identifier containing token boundary must be sensitive"
+    );
+}

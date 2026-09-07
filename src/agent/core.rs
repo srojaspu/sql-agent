@@ -13,7 +13,7 @@ use crate::{
     database::schema::{upsert_schema_memory, ColumnMatch, SchemaMemory, TableDetail},
     database::{ColumnInfo, SqlServer, TableInfo},
     llm::{default_provider, LlmProvider, Message, ToolCall},
-    security::{SecurityPolicy, SqlValidator},
+    security::{is_sensitive_column, SecurityPolicy, SqlValidator},
     util::split_table_name as shared_split_table,
 };
 
@@ -874,35 +874,9 @@ impl Agent {
 
         /*
          * Formatear resultados de forma clara para LLM pequeño
+         * (redaction by header lives inside format_query_result).
          */
-        let mut formatted = format!("✓ RESULTADOS ({} filas)\n\n", result.row_count);
-
-        if result.rows.is_empty() {
-            formatted.push_str("No se encontraron datos.\n");
-        } else {
-            /*
-             * Mostrar cada fila de forma clara
-             */
-            for (idx, row) in result.rows.iter().enumerate() {
-                formatted.push_str(&format!("Fila {}:\n", idx + 1));
-
-                if let Some(obj) = row.as_object() {
-                    for (key, val) in obj {
-                        let display_val = format_cell_value(val);
-
-                        formatted.push_str(&format!("  {} = {}\n", key, display_val));
-                    }
-                } else {
-                    formatted.push_str(&format!("  {}\n", row));
-                }
-
-                formatted.push('\n');
-            }
-        }
-
-        if result.truncated {
-            formatted.push_str("\n[Nota: Resultado limitado al máximo configurado]\n");
-        }
+        let formatted = format_query_result(&result.rows, result.truncated);
 
         Ok(limit_text(&formatted, self.config.max_tool_result_chars))
     }
@@ -1281,6 +1255,37 @@ pub fn format_cell_value(v: &Value) -> String {
     }
 }
 
+/// Format query rows for the LLM, redacting sensitive values by header.
+/// Defense-in-depth: even if a sensitive value reaches this layer (e.g.
+/// legacy `SELECT *`), the header check renders `[REDACTED]` instead.
+pub fn format_query_result(rows: &[Value], truncated: bool) -> String {
+    let mut formatted = format!("✓ RESULTADOS ({} filas)\n\n", rows.len());
+    if rows.is_empty() {
+        formatted.push_str("No se encontraron datos.\n");
+    } else {
+        for (idx, row) in rows.iter().enumerate() {
+            formatted.push_str(&format!("Fila {}:\n", idx + 1));
+            if let Some(obj) = row.as_object() {
+                for (key, val) in obj {
+                    let display_val = if is_sensitive_column(key) {
+                        "[REDACTED]".to_string()
+                    } else {
+                        format_cell_value(val)
+                    };
+                    formatted.push_str(&format!("  {key} = {display_val}\n"));
+                }
+            } else {
+                formatted.push_str(&format!("  {row}\n"));
+            }
+            formatted.push('\n');
+        }
+    }
+    if truncated {
+        formatted.push_str("\n[Nota: Resultado limitado al máximo configurado]\n");
+    }
+    formatted
+}
+
 /// Format the enriched describe output for the LLM (SG-2).
 /// Pure helper: ESTRUCTURA + PK + FK + [VIEW definition] + MUESTRA + COUNT(*).
 pub fn format_table_detail(schema: &str, name: &str, detail: &TableDetail) -> String {
@@ -1340,7 +1345,11 @@ pub fn format_table_detail(schema: &str, name: &str, detail: &TableDetail) -> St
                 let cells: Vec<String> = obj
                     .iter()
                     .map(|(k, v)| {
-                        let display = format_cell_value(v);
+                        let display = if is_sensitive_column(k) {
+                            "[REDACTED]".to_string()
+                        } else {
+                            format_cell_value(v)
+                        };
                         format!("{k} = {display}")
                     })
                     .collect();
@@ -2420,5 +2429,68 @@ mod tests {
             "normalized names must also be shared"
         );
         assert_eq!(cloned.normalized.len(), cloned.tables.len());
+    }
+
+    // ===== slice-1a: render redaction (RED) =====
+
+    #[test]
+    fn format_query_result_redacts_sensitive_header() {
+        // Residual leak at render must show [REDACTED], safe cols stay visible.
+        let rows = vec![serde_json::json!({"id": 1, "password": "secret123"})];
+        let out = format_query_result(&rows, false);
+        assert!(
+            out.contains("[REDACTED]"),
+            "sensitive value must be redacted, got: {out}"
+        );
+        assert!(
+            !out.contains("secret123"),
+            "raw sensitive value must never leak, got: {out}"
+        );
+        assert!(
+            out.contains('1'),
+            "safe value must stay visible, got: {out}"
+        );
+    }
+
+    #[test]
+    fn format_query_result_redacts_token_header_case_insensitive() {
+        // Triangulation: different header casing and column (TOKEN family).
+        let rows = vec![serde_json::json!({"MY_TOKEN": "abc", "name": "ana"})];
+        let out = format_query_result(&rows, false);
+        assert!(
+            out.contains("[REDACTED]"),
+            "token header must be redacted, got: {out}"
+        );
+        assert!(
+            !out.contains("abc"),
+            "raw token must never leak, got: {out}"
+        );
+        assert!(
+            out.contains("ana"),
+            "safe value must stay visible, got: {out}"
+        );
+    }
+
+    #[test]
+    fn format_table_detail_redacts_sensitive_sample() {
+        // Describe sample reaching the formatter with a sensitive key
+        // must render [REDACTED] instead of the raw value.
+        let d = TableDetail {
+            columns: vec![],
+            primary_keys: vec![],
+            foreign_keys: vec![],
+            view_definition: None,
+            sample_rows: vec![serde_json::json!({"id": 1, "api_key": "k-123"})],
+            row_count: 1,
+        };
+        let out = format_table_detail("dbo", "Users", &d);
+        assert!(
+            out.contains("[REDACTED]"),
+            "sensitive sample value must be redacted, got: {out}"
+        );
+        assert!(
+            !out.contains("k-123"),
+            "raw sensitive sample must never leak, got: {out}"
+        );
     }
 }

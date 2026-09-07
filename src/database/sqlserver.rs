@@ -19,6 +19,7 @@ use crate::{
         schema::{ColumnMatch, ForeignKeyInfo, TableDetail},
         ColumnInfo, TableInfo,
     },
+    security::is_sensitive_column,
     util::split_table_name,
 };
 
@@ -320,11 +321,13 @@ impl SqlServer {
             .and_then(|r| r.get::<&str, _>(0))
             .map(str::to_owned);
 
-        // TOP 5 sample + COUNT(*); identifiers escaped by ]-doubling.
+        // TOP 5 sample over safe columns only; identifiers escaped by
+        // ]-doubling. When every column is sensitive, skip the fetch so no
+        // value ever leaves the database (empty sample + redacted render).
         let qualified = format!("{}.{}", escape_ident(&schema), escape_ident(&name));
-        let sample_sql = format!("SELECT TOP 5 * FROM {qualified}");
+        let safe_cols = safe_columns(&columns);
         let mut sample_rows = Vec::new();
-        {
+        if let Some(sample_sql) = describe_sample_sql(&qualified, &safe_cols) {
             let mut sample_stream = timeout(qt, c.query(sample_sql.as_str(), &[]))
                 .await
                 .context("describe sample timeout")??;
@@ -617,6 +620,31 @@ pub fn resolve_describe_row_count(outcome: Result<Option<i64>>) -> i64 {
         Ok(None) => 0,
         Err(_) => -1,
     }
+}
+
+/// Filter describe columns to non-sensitive names only, reusing the
+/// validator sensitive list as the single source. Returns safe names.
+pub fn safe_columns(columns: &[ColumnInfo]) -> Vec<String> {
+    columns
+        .iter()
+        .filter(|c| !is_sensitive_column(&c.column))
+        .map(|c| c.column.clone())
+        .collect()
+}
+
+/// Build the safe TOP 5 sample query over already-escaped qualified name.
+/// Returns None when no column is safe: the caller must skip the fetch and
+/// return an empty sample instead of leaking values.
+pub fn describe_sample_sql(qualified: &str, safe_cols: &[String]) -> Option<String> {
+    if safe_cols.is_empty() {
+        return None;
+    }
+    let cols = safe_cols
+        .iter()
+        .map(|c| escape_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("SELECT TOP 5 {cols} FROM {qualified}"))
 }
 
 /// Format a TDS decimal/numeric value with exact decimal placement.
@@ -1002,5 +1030,65 @@ mod tests {
         // This test pins the exact DECIMAL(19,4) path the CAST workaround relies on.
         let n = tiberius::numeric::Numeric::new_with_scale(199900, 4);
         assert_eq!(format_numeric_value(n), "19.9900");
+    }
+
+    // ===== slice-1a: safe projection (RED) =====
+
+    fn sample_columns_for_safe_test() -> Vec<crate::database::ColumnInfo> {
+        vec![
+            crate::database::ColumnInfo {
+                column: "id".into(),
+                data_type: "int".into(),
+                nullable: false,
+                ordinal: 1,
+            },
+            crate::database::ColumnInfo {
+                column: "password".into(),
+                data_type: "nvarchar".into(),
+                nullable: true,
+                ordinal: 2,
+            },
+            crate::database::ColumnInfo {
+                column: "name".into(),
+                data_type: "nvarchar".into(),
+                nullable: true,
+                ordinal: 3,
+            },
+        ]
+    }
+
+    #[test]
+    fn safe_columns_keeps_only_non_sensitive() {
+        // Mixed table: only safe columns survive (production code must run).
+        let cols = sample_columns_for_safe_test();
+        let safe = safe_columns(&cols);
+        assert_eq!(safe, vec!["id".to_string(), "name".to_string()]);
+        assert!(
+            !safe.iter().any(|c| c.eq_ignore_ascii_case("password")),
+            "sensitive column must be filtered, got: {safe:?}"
+        );
+    }
+
+    #[test]
+    fn describe_sample_sql_projects_safe_cols_only() {
+        // Triangulation: safe projection builds TOP 5 over safe cols (not *).
+        let sql = describe_sample_sql("[dbo].[Users]", &["id".to_string()])
+            .expect("mixed table must produce SQL");
+        assert!(sql.contains("TOP 5"), "sample must be TOP 5, got: {sql}");
+        assert!(sql.contains("[id]"), "safe col must appear, got: {sql}");
+        assert!(
+            !sql.contains("password"),
+            "sensitive col must never leave DB, got: {sql}"
+        );
+        assert!(!sql.contains('*'), "must not use SELECT *, got: {sql}");
+    }
+
+    #[test]
+    fn describe_sample_sql_none_when_all_sensitive() {
+        // All-sensitive table: None means "fetch nothing" (empty sample).
+        assert_eq!(describe_sample_sql("[dbo].[Secrets]", &[]), None);
+        // Non-empty safe list must still produce a query (companion case).
+        let some = describe_sample_sql("[dbo].[Users]", &["id".to_string()]);
+        assert!(some.is_some(), "non-empty safe list must produce SQL");
     }
 }

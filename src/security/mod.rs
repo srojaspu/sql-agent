@@ -1,2 +1,2 @@
 mod validator;
-pub use validator::{SecurityPolicy, SqlValidator};
+pub use validator::{is_sensitive_column, SecurityPolicy, SqlValidator, SENSITIVE_COLUMNS};
