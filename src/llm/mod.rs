@@ -101,16 +101,16 @@ pub trait LlmProvider: Send + Sync {
 }
 
 pub fn default_provider(config: &Config) -> Arc<dyn LlmProvider> {
-    match config.llm_provider.to_ascii_lowercase().as_str() {
+    match config.llm.provider.to_ascii_lowercase().as_str() {
         "openai" | "openai-compatible" => Arc::new(openai::OpenAi::new(config)),
         "google" | "gemini" => Arc::new(google::Google::new(config)),
         "anthropic" | "claude" => Arc::new(anthropic::Anthropic::new(config)),
         _ => Arc::new(Ollama::new(
-            config.ollama_url.clone(),
-            config.ollama_model.clone(),
-            config.ollama_timeout_seconds,
-            config.ollama_temperature,
-            config.ollama_connect_timeout_seconds,
+            config.llm.ollama_url.clone(),
+            config.llm.ollama_model.clone(),
+            config.llm.timeout_s,
+            config.llm.temperature,
+            config.llm.connect_timeout_s,
         )),
     }
 }

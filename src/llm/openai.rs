@@ -18,13 +18,13 @@ pub struct OpenAi {
 impl OpenAi {
     pub fn new(config: &Config) -> Self {
         Self {
-            client: http::client(config.ollama_connect_timeout_seconds)
+            client: http::client(config.llm.connect_timeout_s)
                 .expect("No se pudo crear HTTP client"),
             base_url: http::base_url(config, "https://api.openai.com/v1"),
-            api_key: config.llm_api_key.clone(),
+            api_key: config.llm.api_key.clone(),
             model: http::model(config, "gpt-4o-mini"),
-            timeout_seconds: config.ollama_timeout_seconds,
-            temperature: config.ollama_temperature,
+            timeout_seconds: config.llm.timeout_s,
+            temperature: config.llm.temperature,
         }
     }
 }

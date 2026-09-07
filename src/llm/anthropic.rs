@@ -18,13 +18,13 @@ pub struct Anthropic {
 impl Anthropic {
     pub fn new(config: &Config) -> Self {
         Self {
-            client: http::client(config.ollama_connect_timeout_seconds)
+            client: http::client(config.llm.connect_timeout_s)
                 .expect("No se pudo crear HTTP client"),
             base_url: http::base_url(config, "https://api.anthropic.com/v1"),
-            api_key: config.llm_api_key.clone(),
+            api_key: config.llm.api_key.clone(),
             model: http::model(config, "claude-3-5-haiku-latest"),
-            timeout_seconds: config.ollama_timeout_seconds,
-            temperature: config.ollama_temperature,
+            timeout_seconds: config.llm.timeout_s,
+            temperature: config.llm.temperature,
         }
     }
 }

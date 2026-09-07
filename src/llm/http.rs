@@ -32,17 +32,17 @@ pub async fn send_json(
 }
 
 pub fn model(config: &crate::config::Config, default: &str) -> String {
-    if config.llm_model.trim().is_empty() {
+    if config.llm.model.trim().is_empty() {
         default.to_string()
     } else {
-        config.llm_model.clone()
+        config.llm.model.clone()
     }
 }
 
 pub fn base_url(config: &crate::config::Config, default: &str) -> String {
-    if config.llm_base_url.trim().is_empty() {
+    if config.llm.base_url.trim().is_empty() {
         default.to_string()
     } else {
-        config.llm_base_url.trim_end_matches('/').to_string()
+        config.llm.base_url.trim_end_matches('/').to_string()
     }
 }

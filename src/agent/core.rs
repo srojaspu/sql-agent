@@ -69,14 +69,14 @@ impl Agent {
 
     pub fn with_llm(config: Config, llm: Arc<dyn LlmProvider>) -> Self {
         let policy = SecurityPolicy {
-            max_sql_length: config.max_sql_length,
-            allowed_tables: config.allowed_tables.clone(),
-            block_sensitive_columns: config.block_sensitive_columns,
-            block_comments: config.block_comments,
-            allow_cte: config.allow_cte,
-            allow_system_tables: config.allow_system_tables,
-            max_joins: config.max_joins,
-            max_subqueries: config.max_subqueries,
+            max_sql_length: config.limits.max_sql_length,
+            allowed_tables: config.policy.allowed_tables.clone(),
+            block_sensitive_columns: config.policy.block_sensitive_columns,
+            block_comments: config.policy.block_comments,
+            allow_cte: config.policy.allow_cte,
+            allow_system_tables: config.policy.allow_system_tables,
+            max_joins: config.limits.max_joins,
+            max_subqueries: config.limits.max_subqueries,
         };
 
         Self {
@@ -126,7 +126,7 @@ impl Agent {
 
         let system = Message::system(format!(
             "{} Base de datos: {}.",
-            SYSTEM_PROMPT, self.config.database_name
+            SYSTEM_PROMPT, self.config.db.name
         ));
 
         let mut messages = vec![system, Message::user(question.to_string())];
@@ -141,9 +141,9 @@ impl Agent {
         // Per-turn same-call dedup: repeat returns the cached result + nudge.
         let mut seen: HashMap<String, String> = HashMap::new();
 
-        for step in 1..=self.config.max_steps {
+        for step in 1..=self.config.limits.max_steps {
             if self.config.verbose {
-                println!("\n━━━━━━━━ STEP {step}/{} ━━━━━━━━", self.config.max_steps);
+                println!("\n━━━━━━━━ STEP {step}/{} ━━━━━━━━", self.config.limits.max_steps);
             }
 
             let tool_defs = tools::definitions();
@@ -229,7 +229,7 @@ impl Agent {
                 println!("🔧 Tool calls: {}", reply.tool_calls.len());
             }
 
-            if reply.tool_calls.len() > self.config.max_tool_calls_per_step {
+            if reply.tool_calls.len() > self.config.limits.max_tool_calls_per_step {
                 anyhow::bail!("Demasiadas herramientas en un mismo paso");
             }
 
@@ -246,7 +246,7 @@ impl Agent {
             for call in reply
                 .tool_calls
                 .iter()
-                .take(self.config.max_tool_calls_per_step)
+                .take(self.config.limits.max_tool_calls_per_step)
             {
                 let name = call.function.name.as_str();
 
@@ -297,7 +297,7 @@ impl Agent {
     pub fn build_messages_with_history(&self, session: &Session, question: &str) -> Vec<Message> {
         let mut system_content = format!(
             "{} Base de datos: {}.",
-            SYSTEM_PROMPT, self.config.database_name
+            SYSTEM_PROMPT, self.config.db.name
         );
         // Inject valid schema memory hints (TTL filtered, loop-guard capped)
         let hint_text = build_schema_hint_text(&session.schema_memory);
@@ -381,9 +381,9 @@ impl Agent {
         // Per-turn same-call dedup: repeat returns the cached result + nudge.
         let mut seen: HashMap<String, String> = HashMap::new();
 
-        for step in 1..=self.config.max_steps {
+        for step in 1..=self.config.limits.max_steps {
             if self.config.verbose {
-                println!("\n━━━━━━━━ STEP {step}/{} ━━━━━━━━", self.config.max_steps);
+                println!("\n━━━━━━━━ STEP {step}/{} ━━━━━━━━", self.config.limits.max_steps);
             }
             let tool_defs = tools::definitions();
             // messages already includes system + history + question; for LLM call we use the built messages clone
@@ -435,7 +435,7 @@ impl Agent {
                 continue;
             }
 
-            if reply.tool_calls.len() > self.config.max_tool_calls_per_step {
+            if reply.tool_calls.len() > self.config.limits.max_tool_calls_per_step {
                 anyhow::bail!("Demasiadas herramientas en un mismo paso");
             }
 
@@ -446,7 +446,7 @@ impl Agent {
             for call in reply
                 .tool_calls
                 .iter()
-                .take(self.config.max_tool_calls_per_step)
+                .take(self.config.limits.max_tool_calls_per_step)
             {
                 let name = call.function.name.as_str();
                 if self.config.verbose {
@@ -510,7 +510,7 @@ impl Agent {
                         tbl.clone(),
                         Vec::new(),
                         Some(query_raw.clone()),
-                        self.config.schema_cache_seconds,
+                        self.config.limits.schema_cache_s,
                     );
                 }
                 Ok(result)
@@ -539,7 +539,7 @@ impl Agent {
                     tbl,
                     cols,
                     Some(table.clone()),
-                    self.config.schema_cache_seconds,
+                    self.config.limits.schema_cache_s,
                 );
                 Ok(result)
             }
@@ -558,11 +558,11 @@ impl Agent {
                     &mut session.schema_memory,
                     &matches,
                     &query,
-                    self.config.schema_cache_seconds,
+                    self.config.limits.schema_cache_s,
                 );
                 Ok(limit_text(
                     &format_column_matches(&matches, &query),
-                    self.config.max_tool_result_chars,
+                    self.config.limits.max_tool_result_chars,
                 ))
             }
             "execute_read_query" => self.execute_read_tool(&args, request_id).await,
@@ -628,7 +628,7 @@ impl Agent {
             tables,
             norm,
             Some(&mask),
-            self.config.max_schema_results,
+            self.config.limits.max_schema_results,
         );
 
         if self.config.verbose {
@@ -682,7 +682,7 @@ impl Agent {
         }
 
         Ok((
-            limit_text(&output, self.config.max_tool_result_chars),
+            limit_text(&output, self.config.limits.max_tool_result_chars),
             matched,
         ))
     }
@@ -738,7 +738,7 @@ impl Agent {
         Ok((
             limit_text(
                 &format_table_detail(&schema, &name, &detail),
-                self.config.max_tool_result_chars,
+                self.config.limits.max_tool_result_chars,
             ),
             detail.columns,
         ))
@@ -764,7 +764,7 @@ impl Agent {
             .collect();
         Ok(limit_text(
             &format_table_list(&allowed),
-            self.config.max_tool_result_chars,
+            self.config.limits.max_tool_result_chars,
         ))
     }
 
@@ -791,7 +791,7 @@ impl Agent {
         let matches = self.search_columns_data(&query).await?;
         Ok(limit_text(
             &format_column_matches(&matches, &query),
-            self.config.max_tool_result_chars,
+            self.config.limits.max_tool_result_chars,
         ))
     }
 
@@ -818,9 +818,9 @@ impl Agent {
                 "❌ Consulta bloqueada por política de seguridad: {val_err}\n\
                  Ajusta tu consulta para cumplir la política (ej: solo lectura SELECT, sin comentarios, \
                  máximo {} JOINs y únicamente tablas y columnas autorizadas).",
-                self.config.max_joins
+                self.config.limits.max_joins
             );
-            return Ok(limit_text(&out, self.config.max_tool_result_chars));
+            return Ok(limit_text(&out, self.config.limits.max_tool_result_chars));
         }
 
         if self.config.verbose {
@@ -831,7 +831,7 @@ impl Agent {
             "sql_approved",
             json!({
                 "request_id": request_id,
-                "sql": if self.config.audit_sql {
+                "sql": if self.config.audit.capture_sql {
                     json!(redact_content(sql))
                 } else {
                     json!("[REDACTED]")
@@ -864,7 +864,7 @@ impl Agent {
                         allowed.len().min(17),
                         sql
                     );
-                    return Ok(limit_text(&out, self.config.max_tool_result_chars));
+                    return Ok(limit_text(&out, self.config.limits.max_tool_result_chars));
                 } else {
                     tracing::warn!("SQL execution error returned for self-correction: {msg}");
                     let out = format!(
@@ -873,7 +873,7 @@ impl Agent {
                          verifica las columnas reales con describe_table o search_columns. \
                          Corrige la consulta y ejecútala nuevamente."
                     );
-                    return Ok(limit_text(&out, self.config.max_tool_result_chars));
+                    return Ok(limit_text(&out, self.config.limits.max_tool_result_chars));
                 }
             }
         };
@@ -892,7 +892,7 @@ impl Agent {
          */
         let formatted = format_query_result(&result.rows, result.truncated);
 
-        Ok(limit_text(&formatted, self.config.max_tool_result_chars))
+        Ok(limit_text(&formatted, self.config.limits.max_tool_result_chars))
     }
 
     /*
@@ -902,8 +902,8 @@ impl Agent {
      */
 
     async fn audit(&self, event: &str, payload: Value) -> Result<()> {
-        if self.config.audit_enabled {
-            audit::write(&self.config.audit_path, event, payload).await?;
+        if self.config.audit.enabled {
+            audit::write(&self.config.audit.path, event, payload).await?;
         }
 
         Ok(())
@@ -947,12 +947,12 @@ impl Agent {
         }
 
         // Validate allowlist vs live (drift detection)
-        if !self.config.allowed_tables.is_empty() {
+        if !self.config.policy.allowed_tables.is_empty() {
             let live_names: Vec<String> = tables
                 .iter()
                 .map(|t| format!("{}.{}", t.schema, t.table))
                 .collect();
-            let drifted = Config::find_drifted(&self.config.allowed_tables, &live_names);
+            let drifted = Config::find_drifted(&self.config.policy.allowed_tables, &live_names);
             if !drifted.is_empty() {
                 tracing::warn!(
                     drifted = ?drifted,
@@ -972,7 +972,7 @@ impl Agent {
          */
 
         let cache = SchemaCache {
-            expires_at: Instant::now() + Duration::from_secs(self.config.schema_cache_seconds),
+            expires_at: Instant::now() + Duration::from_secs(self.config.limits.schema_cache_s),
             normalized: Arc::new(precompute_normalized(&tables)),
             tables: Arc::new(tables),
         };
@@ -1003,7 +1003,7 @@ impl Agent {
             Ok("No hay tablas visibles para tu filtro.".to_string())
         } else {
             let mut out = format!("Tablas disponibles ({}):\n", allowed.len());
-            for t in allowed.iter().take(self.config.max_schema_results) {
+            for t in allowed.iter().take(self.config.limits.max_schema_results) {
                 out.push_str(&format!("  • {}.{}\n", t.schema, t.table));
             }
             Ok(out)
@@ -1027,7 +1027,7 @@ impl Agent {
          * si la política está desactivada.
          */
 
-        if !self.config.allow_system_tables
+        if !self.config.policy.allow_system_tables
             && (schema.eq_ignore_ascii_case("sys")
                 || schema.eq_ignore_ascii_case("information_schema"))
         {
@@ -1040,14 +1040,14 @@ impl Agent {
          * excepto las de sistema.
          */
 
-        if self.config.allowed_tables.is_empty() {
+        if self.config.policy.allowed_tables.is_empty() {
             return true;
         }
 
         let full = format!("{}.{}", schema, table).to_ascii_lowercase();
 
         self.config
-            .allowed_tables
+            .policy.allowed_tables
             .iter()
             .any(|x| x.eq_ignore_ascii_case(&full) || x.eq_ignore_ascii_case(table))
     }
@@ -2048,40 +2048,50 @@ mod tests {
     // ===== Task 2.4 run_with_history helpers =====
     fn dummy_config() -> crate::config::Config {
         crate::config::Config {
-            database_host: "localhost".into(),
-            database_port: 1433,
-            database_name: "TestDB".into(),
-            database_user: "user".into(),
-            database_password: "pass".into(),
-            database_trust_cert: true,
-            llm_provider: "ollama".into(),
-            llm_model: String::new(),
-            llm_api_key: String::new(),
-            llm_base_url: String::new(),
-            ollama_url: "http://127.0.0.1:11434".into(),
-            ollama_model: "qwen3:4b".into(),
-            ollama_timeout_seconds: 120,
-            ollama_connect_timeout_seconds: 5,
-            ollama_temperature: 0.0,
-            max_steps: 8,
-            max_sql_length: 10_000,
-            max_rows: 100,
-            schema_cache_seconds: 300,
-            query_timeout_seconds: 30,
-            max_concurrent_queries: 1,
-            max_joins: 5,
-            max_subqueries: 5,
-            max_schema_results: 20,
-            max_tool_result_chars: 20_000,
-            max_tool_calls_per_step: 10,
-            allowed_tables: vec![],
-            block_sensitive_columns: true,
-            block_comments: true,
-            allow_cte: true,
-            allow_system_tables: false,
-            audit_enabled: false,
-            audit_path: "logs/test-audit.jsonl".into(),
-            audit_sql: false,
+            db: crate::config::DbConfig {
+                host: "localhost".into(),
+                port: 1433,
+                name: "TestDB".into(),
+                user: "user".into(),
+                password: "pass".into(),
+                trust_cert: true,
+            },
+            llm: crate::config::LlmConfig {
+                provider: "ollama".into(),
+                model: String::new(),
+                api_key: String::new(),
+                base_url: String::new(),
+                ollama_url: "http://127.0.0.1:11434".into(),
+                ollama_model: "qwen3:4b".into(),
+                timeout_s: 120,
+                connect_timeout_s: 5,
+                temperature: 0.0,
+            },
+            policy: crate::config::PolicyConfig {
+                allowed_tables: vec![],
+                block_sensitive_columns: true,
+                block_comments: true,
+                allow_cte: true,
+                allow_system_tables: false,
+            },
+            limits: crate::config::LimitsConfig {
+                max_steps: 8,
+                max_sql_length: 10_000,
+                max_rows: 100,
+                schema_cache_s: 300,
+                query_timeout_s: 30,
+                max_concurrent_queries: 1,
+                max_joins: 5,
+                max_subqueries: 5,
+                max_schema_results: 20,
+                max_tool_result_chars: 20_000,
+                max_tool_calls_per_step: 10,
+            },
+            audit: crate::config::AuditConfig {
+                enabled: false,
+                path: "logs/test-audit.jsonl".into(),
+                capture_sql: false,
+            },
             verbose: false,
         }
     }

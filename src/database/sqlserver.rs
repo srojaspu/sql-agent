@@ -118,7 +118,7 @@ fn check_privileged_roles(sysadmin: i32, db_owner: i32, control_server: i32) -> 
 impl SqlServer {
     pub fn new(config: Config) -> Self {
         Self {
-            query_gate: Semaphore::new(config.max_concurrent_queries.max(1)),
+            query_gate: Semaphore::new(config.limits.max_concurrent_queries.max(1)),
             pool: OnceCell::new(),
             config,
         }
@@ -129,7 +129,7 @@ impl SqlServer {
             .pool
             .get_or_try_init(|| async {
                 Pool::builder()
-                    .max_size(self.config.max_concurrent_queries.max(1) as u32)
+                    .max_size(self.config.limits.max_concurrent_queries.max(1) as u32)
                     .test_on_check_out(true)
                     .build(TdsConnectionManager {
                         config: self.config.clone(),
@@ -257,7 +257,7 @@ impl SqlServer {
     /// instead of failing.
     pub async fn describe_table_full(&self, table: &str) -> Result<TableDetail> {
         let (schema, name) = split_table_name(table);
-        let qt = Duration::from_secs(self.config.query_timeout_seconds.max(1));
+        let qt = Duration::from_secs(self.config.limits.query_timeout_s.max(1));
         // Single connection shared by every section below (no re-connect per query).
         let mut c = self.connection().await?;
         self.verify_read_only(&mut c).await?;
@@ -403,7 +403,7 @@ impl SqlServer {
             .await?;
 
         let mut stream = timeout(
-            Duration::from_secs(self.config.query_timeout_seconds),
+            Duration::from_secs(self.config.limits.query_timeout_s),
             c.query(sql, &[]),
         )
         .await
@@ -412,10 +412,10 @@ impl SqlServer {
         // Consume como máximo max_rows + 1 filas. Esto evita cargar un resultset
         // potencialmente enorme en memoria solo para descubrir que estaba truncado.
         let deadline =
-            tokio::time::Instant::now() + Duration::from_secs(self.config.query_timeout_seconds);
-        let mut result = Vec::with_capacity(self.config.max_rows);
+            tokio::time::Instant::now() + Duration::from_secs(self.config.limits.query_timeout_s);
+        let mut result = Vec::with_capacity(self.config.limits.max_rows);
         let mut truncated = false;
-        while result.len() <= self.config.max_rows {
+        while result.len() <= self.config.limits.max_rows {
             let next = timeout_at(deadline, stream.try_next())
                 .await
                 .context("Timeout leyendo resultado SQL")??;
@@ -426,7 +426,7 @@ impl SqlServer {
                 // Metadata is not a data row. Other query items are ignored.
                 continue;
             };
-            if result.len() == self.config.max_rows {
+            if result.len() == self.config.limits.max_rows {
                 truncated = true;
                 break;
             }
@@ -446,30 +446,30 @@ impl SqlServer {
 
 fn tds_config(config: &Config) -> TdsConfig {
     let mut tds = TdsConfig::new();
-    tds.host(&config.database_host);
-    tds.port(config.database_port);
-    tds.database(&config.database_name);
+    tds.host(&config.db.host);
+    tds.port(config.db.port);
+    tds.database(&config.db.name);
     tds.authentication(AuthMethod::sql_server(
-        &config.database_user,
-        &config.database_password,
+        &config.db.user,
+        &config.db.password,
     ));
-    if config.database_trust_cert {
+    if config.db.trust_cert {
         tds.trust_cert();
     }
     tds
 }
 
 fn tcp_connect_timeout(config: &Config) -> Duration {
-    Duration::from_secs(if config.ollama_connect_timeout_seconds > 0 {
-        config.ollama_connect_timeout_seconds
+    Duration::from_secs(if config.llm.connect_timeout_s > 0 {
+        config.llm.connect_timeout_s
     } else {
         10
     })
 }
 
 fn tls_handshake_timeout(config: &Config) -> Duration {
-    Duration::from_secs(if config.query_timeout_seconds > 0 {
-        config.query_timeout_seconds
+    Duration::from_secs(if config.limits.query_timeout_s > 0 {
+        config.limits.query_timeout_s
     } else {
         20
     })
@@ -477,7 +477,7 @@ fn tls_handshake_timeout(config: &Config) -> Duration {
 
 async fn connect_tds(config: &Config) -> Result<TdsClient> {
     let tds = tds_config(config);
-    tracing::debug!("🔌 TCP → {}:{}", config.database_host, config.database_port);
+    tracing::debug!("🔌 TCP → {}:{}", config.db.host, config.db.port);
 
     let tcp = timeout(
         tcp_connect_timeout(config),
@@ -1007,8 +1007,8 @@ mod tests {
         }
         // Defaults stay intact at the Config layer.
         let defaults = cfg_with("30", "5");
-        assert_eq!(defaults.query_timeout_seconds, 30);
-        assert_eq!(defaults.ollama_connect_timeout_seconds, 5);
+        assert_eq!(defaults.limits.query_timeout_s, 30);
+        assert_eq!(defaults.llm.connect_timeout_s, 5);
         // SqlServer follows them: TCP <- connect knob, TLS <- query knob.
         assert_eq!(tcp_connect_timeout(&defaults), Duration::from_secs(5));
         assert_eq!(tls_handshake_timeout(&defaults), Duration::from_secs(30));

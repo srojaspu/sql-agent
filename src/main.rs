@@ -49,22 +49,22 @@ async fn main() -> Result<()> {
         println!("╚════════════════════════════════════════════════════╝");
         println!(
             "⚙️  Proveedor/modelo: {}/{}",
-            config.llm_provider,
-            if config.llm_model.is_empty() {
-                &config.ollama_model
+            config.llm.provider,
+            if config.llm.model.is_empty() {
+                &config.llm.ollama_model
             } else {
-                &config.llm_model
+                &config.llm.model
             }
         );
         println!(
             "🗄️  SQL Server: {}:{}",
-            config.database_host, config.database_port
+            config.db.host, config.db.port
         );
-        println!("📁 Base: {}", config.database_name);
+        println!("📁 Base: {}", config.db.name);
         println!("🛡️  Solo lectura: ACTIVADO");
         println!("🔐 SQL Validator: ACTIVADO");
         println!("⚡ Cache esquema: ACTIVADO");
-        println!("🔢 Máximo de pasos: {}", config.max_steps);
+        println!("🔢 Máximo de pasos: {}", config.limits.max_steps);
     }
 
     let agent = Agent::new(config);
