@@ -1,3 +1,11 @@
+//! Session persistence: bounded in-memory history plus redacted JSONL log.
+//!
+//! Imports redaction/rotation from the audit leaves only — never the
+//! audit sink concrete types, keeping `agent::session` out of the
+//! audit cycle.
+
+use crate::audit::redaction::redact_content;
+use crate::audit::rotation::{rotate_file, JSONL_MAX_BYTES, JSONL_MAX_LINES};
 use crate::database::schema::SchemaMemoryEntry;
 use crate::llm::Message;
 use anyhow::Result;
@@ -9,8 +17,6 @@ use tokio::io::AsyncWriteExt;
 
 pub const MAX_MESSAGES: usize = 40;
 pub const MAX_CHARS: usize = 30_000;
-pub const JSONL_MAX_LINES: usize = 10_000;
-pub const JSONL_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -125,22 +131,11 @@ impl Session {
         Self::history_path()
     }
 
+    /// Thin delegate to the shared audit rotation policy.
     pub(crate) async fn rotate_file(path: &Path) -> Result<()> {
-        let content = tokio::fs::read_to_string(path).await.unwrap_or_default();
-        let lines: Vec<&str> = content.lines().collect();
-        // Keep last 5000 lines
-        let keep = if lines.len() > 5000 {
-            &lines[lines.len() - 5000..]
-        } else {
-            &lines[..]
-        };
-        let mut tmp = String::new();
-        for l in keep {
-            tmp.push_str(l);
-            tmp.push('\n');
-        }
-        tokio::fs::write(path, tmp).await?;
-        Ok(())
+        rotate_file(path)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
     }
 
     pub async fn persist(&self) -> Result<()> {
@@ -225,81 +220,6 @@ impl Default for Session {
     fn default() -> Self {
         Self::new()
     }
-}
-
-pub(crate) fn redact_content(content: &str) -> String {
-    let lower = content.to_ascii_lowercase();
-    let sensitive = [
-        "password",
-        "passwd",
-        "secret",
-        "token",
-        "api_key",
-        "private_key",
-        "client_secret",
-        "access_token",
-        "refresh_token",
-    ];
-    for word in sensitive {
-        if lower.contains(word) {
-            return "[REDACTED sensitive content]".to_string();
-        }
-    }
-    content.to_string()
-}
-
-/// Build LLM message context from session history with caps and schema hints.
-/// Pure function for testability; used by Agent::run_with_history.
-pub fn build_history_context(session: &Session, question: &str, max_chars: usize) -> Vec<Message> {
-    let mut out = Vec::new();
-    // Add history messages, respecting char cap
-    let mut total = 0usize;
-    // Iterate history and question, but enforce max_chars
-    let mut all: Vec<Message> = session.messages.clone();
-    all.push(Message::user(question.to_string()));
-    for m in &all {
-        let len = m.content.len();
-        if total + len > max_chars && !out.is_empty() {
-            // Find oldest tool to drop, else drop oldest
-            if let Some(pos) = out.iter().position(|x: &Message| x.role == "tool") {
-                total -= out[pos].content.len();
-                out.remove(pos);
-            } else {
-                total -= out[0].content.len();
-                out.remove(0);
-            }
-            if total + len > max_chars {
-                // truncate current message
-                let truncated: String = m.content.chars().take(max_chars - total).collect();
-                let mut nm = m.clone();
-                nm.content = truncated;
-                out.push(nm);
-                break;
-            }
-        }
-        total += len;
-        out.push(m.clone());
-        // Also enforce 40 message cap on context window
-        while out.len() > MAX_MESSAGES {
-            if let Some(pos) = out.iter().position(|x: &Message| x.role == "tool") {
-                total -= out[pos].content.len();
-                out.remove(pos);
-            } else {
-                total -= out[0].content.len();
-                out.remove(0);
-            }
-        }
-    }
-    out
-}
-
-/// Detect anaphora that refers to previous results (y de esos, de esos, etc.)
-pub fn is_anaphoric(question: &str) -> bool {
-    let lower = question.to_ascii_lowercase();
-    lower.contains("de esos")
-        || lower.contains("de esas")
-        || lower.contains("y esos")
-        || lower.contains("y esas")
 }
 
 #[cfg(test)]
@@ -401,37 +321,12 @@ mod tests {
     }
 
     #[test]
-    fn redact_sensitive_replaces_password() {
+    fn redact_uses_audit_single_source() {
+        // Pins the import: session redaction IS audit redaction.
         let c = "SELECT password FROM users";
         assert_eq!(redact_content(c), "[REDACTED sensitive content]");
         let ok = "SELECT name FROM users";
         assert_eq!(redact_content(ok), ok);
-    }
-
-    #[test]
-    fn build_history_context_includes_history() {
-        let mut s = Session::new();
-        s.push(Message::user("cuantos usuarios hay".into()));
-        s.push(Message::tool(
-            "execute_read_query",
-            "✓ RESULTADOS (2 filas) Fila 1: name=Juan".into(),
-        ));
-        let ctx = build_history_context(&s, "y de esos cuantos activos", 30_000);
-        // Should contain history + new question
-        assert!(ctx.len() >= 3, "should include history + question");
-        assert!(ctx
-            .iter()
-            .any(|m| m.content.contains("cuantos usuarios hay")));
-        assert!(ctx
-            .iter()
-            .any(|m| m.content.contains("y de esos cuantos activos")));
-    }
-
-    #[test]
-    fn is_anaphoric_detects_y_de_esos() {
-        assert!(is_anaphoric("y de esos cuantos activos"));
-        assert!(is_anaphoric("y de esas cuantas activas"));
-        assert!(!is_anaphoric("cuantos usuarios hay en total"));
     }
 
     #[tokio::test]

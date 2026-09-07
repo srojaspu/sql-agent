@@ -9,7 +9,6 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::{
-    audit,
     config::Config,
     database::schema::{upsert_schema_memory, ColumnMatch, SchemaMemory, TableDetail},
     database::{ColumnInfo, SqlServer, TableInfo},
@@ -18,9 +17,12 @@ use crate::{
     util::split_table_name as shared_split_table,
 };
 
+use crate::audit::redaction::redact_content;
+use crate::audit::{AuditSink, FileAuditSink};
+
 use crate::agent::{
     prompt::SYSTEM_PROMPT,
-    session::{build_history_context, is_anaphoric, redact_content, Session, MAX_CHARS},
+    session::{build_history_context, is_anaphoric, Session, MAX_CHARS},
     tools,
 };
 
@@ -60,6 +62,7 @@ pub struct Agent {
     llm: Arc<dyn LlmProvider>,
     validator: SqlValidator,
     schema: Arc<RwLock<Option<SchemaCache>>>,
+    audit: Arc<dyn AuditSink>,
 }
 
 impl Agent {
@@ -86,6 +89,8 @@ impl Agent {
             validator: SqlValidator::new(policy),
 
             schema: Arc::new(RwLock::new(None)),
+
+            audit: Arc::new(FileAuditSink::new(config.audit.path.clone())),
 
             config,
         }
@@ -903,7 +908,7 @@ impl Agent {
 
     async fn audit(&self, event: &str, payload: Value) -> Result<()> {
         if self.config.audit.enabled {
-            audit::write(&self.config.audit.path, event, payload).await?;
+            self.audit.write(event, payload).await?;
         }
 
         Ok(())
