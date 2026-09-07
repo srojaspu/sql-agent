@@ -366,6 +366,8 @@ mod tests {
             rendered.contains("MAX_STEPS (12)"),
             "dynamic prompt must render 12-step limit"
         );
+        // Regenerate golden file for debugging - remove after first run
+        // std::fs::write("tests/golden/system_prompt_max12.txt", &rendered).unwrap();
         assert_eq!(
             rendered, golden,
             "rendered prompt must match golden snapshot byte-for-byte"
