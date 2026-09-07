@@ -1,3 +1,9 @@
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ExportFormat {
+    Csv,
+    Json,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Clear,
@@ -7,6 +13,7 @@ pub enum Command {
     Refresh,
     Quit,
     Help,
+    Export { format: ExportFormat, path: Option<String> },
     Unknown(String),
     Message(String),
 }
@@ -29,12 +36,31 @@ pub fn parse_command(input: &str) -> Command {
                 Command::Describe(tbl)
             }
         }
+        s if s.starts_with("/export") => {
+            // /export csv [path] or /export json [path]
+            let parts: Vec<&str> = s.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let format = match parts[1].to_lowercase().as_str() {
+                    "csv" => ExportFormat::Csv,
+                    "json" => ExportFormat::Json,
+                    _ => return Command::Unknown(s.to_string()),
+                };
+                let path = if parts.len() >= 3 {
+                    Some(parts[2].to_string())
+                } else {
+                    None
+                };
+                Command::Export { format, path }
+            } else {
+                Command::Unknown(s.to_string())
+            }
+        }
         s if s.starts_with('/') => Command::Unknown(s.to_string()),
         other => Command::Message(other.to_string()),
     }
 }
 
-pub const HELP_TEXT: &str = "Comandos: /clear /history /tables /describe <tabla> /refresh /quit /help | Teclas: Enter enviar, Esc salir, ↑↓ scroll, PgUp/PgDn, Ctrl-C salir";
+pub const HELP_TEXT: &str = "Comandos: /clear /history /tables /describe <tabla> /refresh /export csv|json [ruta] /quit /help | Teclas: Enter enviar, Esc salir, ↑↓ scroll, PgUp/PgDn, Ctrl-C salir";
 
 #[cfg(test)]
 mod tests {
@@ -83,5 +109,38 @@ mod tests {
         );
         assert_eq!(parse_command(""), Command::Message("".into()));
         assert_eq!(parse_command("   "), Command::Message("".into()));
+    }
+
+    #[test]
+    fn parse_command_export_csv_and_json() {
+        assert_eq!(
+            parse_command("/export csv"),
+            Command::Export { format: ExportFormat::Csv, path: None }
+        );
+        assert_eq!(
+            parse_command("/export json"),
+            Command::Export { format: ExportFormat::Json, path: None }
+        );
+        assert_eq!(
+            parse_command("/export csv /tmp/out.csv"),
+            Command::Export { format: ExportFormat::Csv, path: Some("/tmp/out.csv".into()) }
+        );
+        assert_eq!(
+            parse_command("/export json ./export.json"),
+            Command::Export { format: ExportFormat::Json, path: Some("./export.json".into()) }
+        );
+        // case-insensitive
+        assert_eq!(
+            parse_command("/export CSV"),
+            Command::Export { format: ExportFormat::Csv, path: None }
+        );
+        assert_eq!(
+            parse_command("/export Json"),
+            Command::Export { format: ExportFormat::Json, path: None }
+        );
+        // invalid format -> Unknown
+        assert!(matches!(parse_command("/export xml"), Command::Unknown(_)));
+        // missing format -> Unknown
+        assert!(matches!(parse_command("/export"), Command::Unknown(_)));
     }
 }

@@ -23,13 +23,13 @@ use crate::agent::{
 
 use super::{
     format::{
-        format_invalid_reinject, format_query_result, format_table_detail, format_table_list,
-        limit_text, looks_like_sql, split_table,
+        format_history_readable, format_invalid_reinject, format_query_result,
+        format_table_detail, format_table_list, limit_text, looks_like_sql, split_table,
     },
     memory::{
         build_schema_hint_text, dedup_key, normalize_tool_arguments, SchemaCache,
     },
-    ranking::{search_with_fallback_masked, NormalizedEntry},
+    ranking::{search_with_fallback_masked, NormalizedEntry, strip_accents},
 };
 
 pub struct Agent {
@@ -110,6 +110,38 @@ impl Agent {
             }),
         )
         .await?;
+
+        // Inventory shortcut: if user asks "how many tables/views", answer directly without LLM
+        if is_table_inventory_question(question) {
+            let tables = self.cached_tables().await?;
+            let visible: Vec<_> = tables
+                .iter()
+                .filter(|table| self.table_allowed(&table.schema, &table.table))
+                .collect();
+            let table_count = visible
+                .iter()
+                .filter(|table| table.table_type.eq_ignore_ascii_case("BASE TABLE"))
+                .count();
+            let view_count = visible
+                .iter()
+                .filter(|table| table.table_type.eq_ignore_ascii_case("VIEW"))
+                .count();
+            self.audit(
+                "response",
+                json!({
+                    "request_id": request_id,
+                    "tools_used": ["list_tables"],
+                    "table_count": table_count,
+                    "view_count": view_count
+                }),
+            )
+            .await?;
+            return Ok(format!(
+                "Objetos visibles en **{}**: **{table_count} tablas base** y **{view_count} vistas** (**{} objetos en total**).",
+                self.config.db.name,
+                table_count + view_count
+            ));
+        }
 
         /*
          * ============================================================
@@ -334,21 +366,7 @@ impl Agent {
             return Ok("🧹 Historial limpiado".to_string());
         }
         if trimmed == "/history" {
-            let hist: Vec<String> = session
-                .messages
-                .iter()
-                .map(|m| {
-                    format!(
-                        "{}: {}",
-                        m.role,
-                        m.content.chars().take(200).collect::<String>()
-                    )
-                })
-                .collect();
-            if hist.is_empty() {
-                return Ok("Historial vacío".to_string());
-            }
-            return Ok(hist.join("\n"));
+            return Ok(format_history_readable(session));
         }
 
         let request_id = Uuid::new_v4().to_string();
@@ -1133,7 +1151,7 @@ mod tests {
         );
     }
 
-    #[test]
+#[test]
     fn build_messages_uses_dynamic_max_steps() {
         let mut cfg = dummy_config();
         cfg.limits.max_steps = 12;
@@ -1147,4 +1165,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn is_table_inventory_question_detects_count_questions() {
+        assert!(is_table_inventory_question("cuantas tablas hay"));
+        assert!(is_table_inventory_question("cuántas tablas hay"));
+        assert!(is_table_inventory_question("cuantos vistas"));
+        assert!(is_table_inventory_question("número total de tablas"));
+        assert!(is_table_inventory_question("total de tablas y vistas"));
+        // Non-inventory questions should return false
+        assert!(!is_table_inventory_question("cuantos usuarios hay"));
+        assert!(!is_table_inventory_question("muestra productos"));
+        assert!(!is_table_inventory_question("hola"));
+    }
+}
+
+fn is_table_inventory_question(question: &str) -> bool {
+    let normalized = strip_accents(&question.to_ascii_lowercase());
+    let asks_for_count = normalized.contains("cuanto")
+        || normalized.contains("cuantos")
+        || normalized.contains("cuantas")
+        || normalized.contains("numero")
+        || normalized.contains("total");
+    let asks_for_tables = normalized.contains("tabla")
+        || normalized.contains("tablas")
+        || normalized.contains("vista")
+        || normalized.contains("vistas");
+    asks_for_count && asks_for_tables
 }

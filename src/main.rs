@@ -243,6 +243,28 @@ async fn run_tui(agent: Agent) -> Result<()> {
                                             });
                                             app.session.schema_memory.clear();
                                         }
+                                        tui::ui::Command::Export { format, path } => {
+                                            app.clear_input();
+                                            // Export uses structured messages from app.state (not markdown parsing)
+                                            let messages = &app.messages;
+                                            let exported = match format {
+                                                tui::commands::ExportFormat::Csv => {
+                                                    tui::state::export_messages_csv(messages)
+                                                }
+                                                tui::commands::ExportFormat::Json => {
+                                                    tui::state::export_messages_json(messages)
+                                                }
+                                            };
+                                            let default_path = match format {
+                                                tui::commands::ExportFormat::Csv => "export.csv",
+                                                tui::commands::ExportFormat::Json => "export.json",
+                                            };
+                                            let file_path = path.unwrap_or_else(|| default_path.to_string());
+                                            match std::fs::write(&file_path, exported) {
+                                                Ok(_) => app.set_status(format!("Resultados exportados a {}", file_path)),
+                                                Err(e) => app.set_status(format!("Error exportando: {e}")),
+                                            }
+                                        }
                                         tui::ui::Command::Unknown(u) => {
                                             app.set_status(format!("Comando desconocido: {u} — escribe /help"));
                                             app.clear_input();
