@@ -6,9 +6,9 @@ use uuid::Uuid;
 
 use crate::{
     config::Config,
-    database::schema::{upsert_schema_memory, ColumnMatch, TableDetail},
+    database::schema::{ColumnMatch, TableDetail},
     database::{SqlServer, TableInfo},
-    llm::{default_provider, LlmProvider, Message, ToolCall},
+    llm::{default_provider, LlmProvider, Message},
     security::{SecurityPolicy, SqlValidator},
 };
 
@@ -23,12 +23,11 @@ use crate::agent::{
 
 use super::{
     format::{
-        format_column_matches, format_invalid_reinject, format_query_result, format_table_detail,
-        format_table_list, limit_text, looks_like_sql, split_table,
+        format_invalid_reinject, format_query_result, format_table_detail, format_table_list,
+        limit_text, looks_like_sql, split_table,
     },
     memory::{
-        build_schema_hint_text, dedup_key, ground_memory_from_column_matches,
-        normalize_tool_arguments, SchemaCache, MEMORY_GROUNDING_LIMIT,
+        build_schema_hint_text, dedup_key, normalize_tool_arguments, SchemaCache,
     },
     ranking::{search_with_fallback_masked, NormalizedEntry},
 };
@@ -244,7 +243,7 @@ impl Agent {
                         "{cached} (duplicate call deduped — retry with different arguments if needed)"
                     )
                 } else {
-                    let out = self.dispatch_tool(call, &request_id).await?;
+                    let out = self.dispatch_tool(call, &request_id, None).await?;
                     seen.insert(dedup_k, out.clone());
                     out
                 };
@@ -444,7 +443,7 @@ impl Agent {
                     )
                 } else {
                     let out = self
-                        .dispatch_tool_with_history(call, &request_id, session)
+                        .dispatch_tool(call, &request_id, Some(&mut *session))
                         .await?;
                     seen.insert(dedup_k, out.clone());
                     out
@@ -464,125 +463,12 @@ impl Agent {
         anyhow::bail!("Se alcanzó MAX_STEPS sin obtener una respuesta final")
     }
 
-    async fn dispatch_tool_with_history(
-        &self,
-        call: &ToolCall,
-        request_id: &str,
-        session: &mut Session,
-    ) -> Result<String> {
-        let args = normalize_tool_arguments(&call.function.arguments)?;
-        match call.function.name.as_str() {
-            "search_schema" => {
-                let query_raw = args
-                    .get("query")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                // Single ranking inside; reuse `matched` for memory (no
-                // second search_with_fallback, no per-table describe calls).
-                let (result, matched) = self.search_schema_ranked(&query_raw).await?;
-                for tbl in matched.iter().take(MEMORY_GROUNDING_LIMIT) {
-                    let key = format!("{}.{}", tbl.schema, tbl.table);
-                    // No DB fetch: ground with table identity + synonym only.
-                    // Empty columns preserve any previously stored full list.
-                    upsert_schema_memory(
-                        &mut session.schema_memory,
-                        key,
-                        tbl.clone(),
-                        Vec::new(),
-                        Some(query_raw.clone()),
-                        self.config.limits.schema_cache_s,
-                    );
-                }
-                Ok(result)
-            }
-            "describe_table" => {
-                let table = args
-                    .get("table")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                // Single describe_table_full fetch; reuse its columns for
-                // memory instead of a second describe_table DB call.
-                let (result, cols) = self.describe_table_tool_with_detail(&args).await?;
-                let (schema, name) = split_table(&table);
-                let key = format!("{}.{}", schema, name);
-                let tbl = TableInfo {
-                    schema: schema.clone(),
-                    table: name.clone(),
-                    // Real type travels on discovery lists; unknown on this path.
-                    table_type: String::new(),
-                };
-                upsert_schema_memory(
-                    &mut session.schema_memory,
-                    key,
-                    tbl,
-                    cols,
-                    Some(table.clone()),
-                    self.config.limits.schema_cache_s,
-                );
-                Ok(result)
-            }
-            "list_tables" => self.list_tables_tool().await,
-            "search_columns" => {
-                let query = args
-                    .get("query")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                let matches = self.search_columns_data(&query).await?;
-                // Reuse already-fetched match rows for memory (deduped by
-                // table, max MEMORY_GROUNDING_LIMIT tables, zero DB calls).
-                ground_memory_from_column_matches(
-                    &mut session.schema_memory,
-                    &matches,
-                    &query,
-                    self.config.limits.schema_cache_s,
-                );
-                Ok(limit_text(
-                    &format_column_matches(&matches, &query),
-                    self.config.limits.max_tool_result_chars,
-                ))
-            }
-            "execute_read_query" => self.execute_read_tool(&args, request_id).await,
-            other => anyhow::bail!("Tool no permitida: {other}"),
-        }
-    }
-
     /*
      * ================================================================
-     * VALIDADOR DE COMPLETITUD
+     * TOOL DISPATCH lives in `agent::dispatcher` (single unified
+     * `dispatch_tool` for both loops; no duplicated match arms).
      * ================================================================
      */
-
-    /*
-     * ================================================================
-     * TOOL DISPATCH
-     * ================================================================
-     */
-
-    async fn dispatch_tool(&self, call: &ToolCall, request_id: &str) -> Result<String> {
-        let args = normalize_tool_arguments(&call.function.arguments)?;
-
-        match call.function.name.as_str() {
-            "search_schema" => self.search_schema(&args).await,
-
-            "describe_table" => self.describe_table_tool(&args).await,
-
-            "list_tables" => self.list_tables_tool().await,
-
-            "search_columns" => self.search_columns_tool(&args).await,
-
-            "execute_read_query" => self.execute_read_tool(&args, request_id).await,
-
-            other => {
-                anyhow::bail!("Tool no permitida: {other}");
-            }
-        }
-    }
 
     /*
      * ================================================================
@@ -594,7 +480,7 @@ impl Agent {
     /// Returns (formatted_output, matched) so history dispatch reuses `matched`
     /// for memory without a second `search_with_fallback` call. The zero-hit
     /// top list comes from the same ranking pass (no re-rank loop).
-    async fn search_schema_ranked(&self, query_raw: &str) -> Result<(String, Vec<TableInfo>)> {
+    pub(crate) async fn search_schema_ranked(&self, query_raw: &str) -> Result<(String, Vec<TableInfo>)> {
         let snapshot = self.cached_schema().await?;
         let tables: &[TableInfo] = &snapshot.tables;
         let norm: &[NormalizedEntry] = &snapshot.normalized;
@@ -669,16 +555,6 @@ impl Agent {
         ))
     }
 
-    async fn search_schema(&self, args: &Value) -> Result<String> {
-        let query_raw = args
-            .get("query")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        Ok(self.search_schema_ranked(&query_raw).await?.0)
-    }
-
     /*
      * ================================================================
      * DESCRIBE TABLE
@@ -688,7 +564,7 @@ impl Agent {
     /// Describe once and return (formatted_output, columns): history dispatch
     /// reuses `columns` for schema memory instead of a second `describe_table`
     /// DB call. Single `describe_table_full` fetch, same format as before.
-    async fn describe_table_tool_with_detail(
+    pub(crate) async fn describe_table_tool_with_detail(
         &self,
         args: &Value,
     ) -> Result<(String, Vec<crate::database::ColumnInfo>)> {
@@ -737,7 +613,7 @@ impl Agent {
      */
 
     /// List every visible table and view (SG-1). Cached via `cached_tables`.
-    async fn list_tables_tool(&self) -> Result<String> {
+    pub(crate) async fn list_tables_tool(&self) -> Result<String> {
         let tables = self.cached_tables().await?;
         let allowed: Vec<TableInfo> = tables
             .iter()
@@ -751,7 +627,7 @@ impl Agent {
     }
 
     /// Structured column search filtered by the allowlist (SG-1).
-    async fn search_columns_data(&self, query: &str) -> Result<Vec<ColumnMatch>> {
+    pub(crate) async fn search_columns_data(&self, query: &str) -> Result<Vec<ColumnMatch>> {
         if query.trim().is_empty() {
             anyhow::bail!("Falta query");
         }
@@ -762,28 +638,13 @@ impl Agent {
             .collect())
     }
 
-    /// Formatted column search for the LLM (SG-1).
-    async fn search_columns_tool(&self, args: &Value) -> Result<String> {
-        let query = args
-            .get("query")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let matches = self.search_columns_data(&query).await?;
-        Ok(limit_text(
-            &format_column_matches(&matches, &query),
-            self.config.limits.max_tool_result_chars,
-        ))
-    }
-
     /*
      * ================================================================
      * EXECUTE READ QUERY
      * ================================================================
      */
 
-    async fn execute_read_tool(&self, args: &Value, request_id: &str) -> Result<String> {
+    pub(crate) async fn execute_read_tool(&self, args: &Value, request_id: &str) -> Result<String> {
         let sql = args.get("sql").and_then(Value::as_str).unwrap_or("").trim();
 
         if sql.is_empty() {
@@ -1183,6 +1044,72 @@ mod tests {
         let mut session = crate::agent::session::Session::new();
         let res = agent.run_with_history(&mut session, "   ").await;
         assert!(res.is_err());
+    }
+
+    // ===== slice D step 2: unified-dispatch parity (lock-in guard) =====
+    // Same tool-call input through the unified dispatcher with and without a
+    // session must produce identical output; the session path additionally
+    // grounds memory. The pre-unification probe showed both twin paths already
+    // agreed on outputs (divergence was session side-effects only), so this
+    // guard pins the fused behavior. Only DB-free arms run here; DB-touching
+    // arms share the same callees on both paths by construction.
+    #[tokio::test]
+    async fn dispatch_unified_parity_none_vs_session() {
+        use crate::llm::{ToolCall, ToolFunction};
+
+        fn call(name: &str, args: serde_json::Value) -> ToolCall {
+            ToolCall {
+                id: None,
+                function: ToolFunction {
+                    name: name.to_string(),
+                    arguments: args,
+                },
+            }
+        }
+
+        let agent = Agent::new(dummy_config());
+        let mut session = crate::agent::session::Session::new();
+
+        // Every case below resolves without touching the DB.
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            // Policy-blocked SQL short-circuits before audit/DB.
+            (
+                "execute_read_query",
+                serde_json::json!({"sql": "DELETE FROM dbo.Usuario"}),
+            ),
+            // Missing-arg bails precede any DB call.
+            ("execute_read_query", serde_json::json!({"sql": ""})),
+            ("execute_read_query", serde_json::json!({})),
+            ("describe_table", serde_json::json!({"table": ""})),
+            ("search_columns", serde_json::json!({"query": ""})),
+            ("search_columns", serde_json::json!({})),
+            // Unknown tool never reaches the DB.
+            ("herramienta_fantasma", serde_json::json!({})),
+        ];
+
+        for (name, args) in cases {
+            let c = call(name, args);
+            let without = agent.dispatch_tool(&c, "req-parity", None).await;
+            let with = agent
+                .dispatch_tool(&c, "req-parity", Some(&mut session))
+                .await;
+            match (without, with) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(a, b, "dispatch output diverged for tool '{name}'")
+                }
+                (Err(a), Err(b)) => assert_eq!(
+                    a.to_string(),
+                    b.to_string(),
+                    "dispatch error diverged for tool '{name}'"
+                ),
+                (a, b) => panic!("dispatch ok/err diverged for tool '{name}': {a:?} vs {b:?}"),
+            }
+        }
+        // Bail-out arms ground nothing: session memory stays empty.
+        assert!(
+            session.schema_memory.is_empty(),
+            "unified dispatch must not ground memory on bail-out arms"
+        );
     }
 
 }

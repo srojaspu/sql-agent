@@ -1,4 +1,5 @@
 mod core;
+mod dispatcher;
 pub mod format;
 pub mod memory;
 pub mod prompt;
