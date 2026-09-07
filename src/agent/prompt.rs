@@ -90,6 +90,16 @@ La aplicación impone controles de seguridad adicionales.
 No intentes evadirlos.
 "#;
 
+/// Generate the system prompt with a dynamic step budget.
+///
+/// S2 wiring: interpolates `limits.max_steps` into the autonomy marker so
+/// the loop budget in the prompt always matches config. S3 will upgrade
+/// this to a full `SYSTEM_PROMPT_TEMPLATE` with grounding consts; the
+/// signature stays stable.
+pub fn system_prompt(max_steps: usize) -> String {
+    SYSTEM_PROMPT.replace("MAX_STEPS (8)", &format!("MAX_STEPS ({max_steps})"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +229,25 @@ mod tests {
         assert!(
             SYSTEM_PROMPT.contains("| Rol | Código | Cantidad |"),
             "presentation table header must stay"
+        );
+    }
+
+    #[test]
+    fn system_prompt_renders_dynamic_max_steps() {
+        let p12 = system_prompt(12);
+        assert!(
+            p12.contains("MAX_STEPS (12)"),
+            "dynamic prompt must render 12-step limit, got: {}",
+            &p12[..500.min(p12.len())]
+        );
+        assert!(
+            !p12.contains("MAX_STEPS (8)"),
+            "dynamic prompt with 12 must not keep default 8"
+        );
+        let p8 = system_prompt(8);
+        assert!(
+            p8.contains("MAX_STEPS (8)"),
+            "default budget must still render"
         );
     }
 }

@@ -16,7 +16,7 @@ use crate::audit::redaction::redact_content;
 use crate::audit::{AuditSink, FileAuditSink};
 
 use crate::agent::{
-    prompt::SYSTEM_PROMPT,
+    prompt::system_prompt,
     session::{build_history_context, is_anaphoric, Session, MAX_CHARS},
     tools,
 };
@@ -119,7 +119,8 @@ impl Agent {
 
         let system = Message::system(format!(
             "{} Base de datos: {}.",
-            SYSTEM_PROMPT, self.config.db.name
+            system_prompt(self.config.limits.max_steps),
+            self.config.db.name
         ));
 
         let mut messages = vec![system, Message::user(question.to_string())];
@@ -290,7 +291,8 @@ impl Agent {
     pub fn build_messages_with_history(&self, session: &Session, question: &str) -> Vec<Message> {
         let mut system_content = format!(
             "{} Base de datos: {}.",
-            SYSTEM_PROMPT, self.config.db.name
+            system_prompt(self.config.limits.max_steps),
+            self.config.db.name
         );
         // Inject valid schema memory hints (TTL filtered, loop-guard capped)
         let hint_text = build_schema_hint_text(&session.schema_memory);
@@ -762,7 +764,7 @@ impl Agent {
      * ================================================================
      */
 
-    async fn audit(&self, event: &str, payload: Value) -> Result<()> {
+    pub(crate) async fn audit(&self, event: &str, payload: Value) -> Result<()> {
         if self.config.audit.enabled {
             self.audit.write(event, payload).await?;
         }
@@ -1128,6 +1130,20 @@ mod tests {
         assert!(
             session.schema_memory.is_empty(),
             "unified dispatch must not ground memory on bail-out arms"
+        );
+    }
+
+    #[test]
+    fn build_messages_uses_dynamic_max_steps() {
+        let mut cfg = dummy_config();
+        cfg.limits.max_steps = 12;
+        let agent = Agent::new(cfg);
+        let session = crate::agent::session::Session::new();
+        let msgs = agent.build_messages_with_history(&session, "hola");
+        assert!(
+            msgs[0].content.contains("MAX_STEPS (12)"),
+            "system prompt must wire limits.max_steps=12, got: {}",
+            &msgs[0].content[..500.min(msgs[0].content.len())]
         );
     }
 
