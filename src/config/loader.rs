@@ -8,6 +8,7 @@
 use anyhow::{Context, Result};
 
 use super::{AppConfig, AuditConfig, DbConfig, LimitsConfig, LlmConfig, PolicyConfig};
+use super::db::sanitize_db_name;
 use crate::util::normalize_table_name;
 
 impl AppConfig {
@@ -41,7 +42,7 @@ impl AppConfig {
             db: DbConfig {
                 host: get_required(map, "DATABASE_HOST")?,
                 port: parse_u16_map(map, "DATABASE_PORT", 1433)?,
-                name: get_required(map, "DATABASE_NAME")?,
+                name: sanitize_db_name(&get_required(map, "DATABASE_NAME")?)?,
                 user: get_required(map, "DATABASE_USER")?,
                 password: get_required(map, "DATABASE_PASSWORD")?,
                 trust_cert: parse_bool_map(map, "DATABASE_TRUST_CERT", false)?,
@@ -62,8 +63,10 @@ impl AppConfig {
                 temperature: get_default_map(map, "OLLAMA_TEMPERATURE", "0.0")
                     .parse()
                     .context("OLLAMA_TEMPERATURE inválido")?,
-                // S1 default only: S2 wires the `LLM_MAX_RETRIES` env knob.
-                max_retries: 3,
+                // Wired knob: 0 means a single attempt with no retry.
+                max_retries: get_default_map(map, "LLM_MAX_RETRIES", "3")
+                    .parse()
+                    .context("LLM_MAX_RETRIES inválido")?,
             },
             policy: PolicyConfig {
                 allowed_tables,
@@ -148,6 +151,7 @@ impl AppConfig {
             "LLM_MODEL",
             "LLM_API_KEY",
             "LLM_BASE_URL",
+            "LLM_MAX_RETRIES",
             "OLLAMA_URL",
             "OLLAMA_MODEL",
             "OLLAMA_TIMEOUT_SECONDS",
@@ -454,5 +458,59 @@ mod tests {
             drifted.is_empty(),
             "case-insensitive match should not drift"
         );
+    }
+
+    #[test]
+    fn llm_max_retries_defaults_to_three() {
+        let m = minimal_map();
+        let cfg = AppConfig::from_map(&m).expect("defaults should parse");
+        assert_eq!(cfg.llm.max_retries, 3);
+    }
+
+    #[test]
+    fn llm_max_retries_custom_bound_respected() {
+        let mut m = minimal_map();
+        m.insert("LLM_MAX_RETRIES".into(), "1".into());
+        let cfg = AppConfig::from_map(&m).expect("custom bound should parse");
+        assert_eq!(cfg.llm.max_retries, 1);
+    }
+
+    #[test]
+    fn llm_max_retries_zero_means_single_attempt() {
+        let mut m = minimal_map();
+        m.insert("LLM_MAX_RETRIES".into(), "0".into());
+        let cfg = AppConfig::from_map(&m).expect("zero should parse");
+        assert_eq!(cfg.llm.max_retries, 0);
+    }
+
+    #[test]
+    fn llm_max_retries_invalid_rejected() {
+        let mut m = minimal_map();
+        m.insert("LLM_MAX_RETRIES".into(), "abc".into());
+        let err = AppConfig::from_map(&m).unwrap_err().to_string();
+        assert!(
+            err.contains("LLM_MAX_RETRIES inválido"),
+            "invalid retries must report typed message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn database_name_illegal_rejected_before_connect() {
+        let mut m = minimal_map();
+        m.insert("DATABASE_NAME".into(), "my db!".into());
+        assert!(
+            AppConfig::from_map(&m).is_err(),
+            "illegal DATABASE_NAME must be rejected with no connection attempted"
+        );
+    }
+
+    #[test]
+    fn database_name_empty_and_overlong_rejected() {
+        let mut m = minimal_map();
+        m.insert("DATABASE_NAME".into(), "".into());
+        assert!(AppConfig::from_map(&m).is_err());
+        let mut m2 = minimal_map();
+        m2.insert("DATABASE_NAME".into(), "a".repeat(129));
+        assert!(AppConfig::from_map(&m2).is_err());
     }
 }

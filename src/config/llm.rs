@@ -63,7 +63,7 @@ pub struct LlmConfig {
 
     /// Maximum LLM retry attempts for transient failures (429/5xx/timeout).
     ///
-    /// Env: `LLM_MAX_RETRIES` (default `3`; S1 default only — S2 wires the
-    /// env knob. `0` means a single attempt with no retry).
+    /// Env: `LLM_MAX_RETRIES` (default `3`; `0` means a single attempt
+    /// with no retry).
     pub max_retries: u8,
 }
