@@ -9,8 +9,23 @@ fn env(key: &str) -> Result<String> {
 }
 
 #[tokio::test]
+#[ignore = "live DB: run explicitly with DATABASE_* env configured"]
 async fn test_sql_server_connection() -> Result<()> {
     dotenvy::dotenv().ok();
+
+    // Offline hygiene: skip (do not fail) when no DB env is configured.
+    if std::env::var("DATABASE_HOST")
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+        || std::env::var("DATABASE_PORT")
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+    {
+        println!("Skipping live DB test: DATABASE_HOST/DATABASE_PORT not set");
+        return Ok(());
+    }
 
     let host = env("DATABASE_HOST")?;
     let port: u16 = env("DATABASE_PORT")?.parse()?;

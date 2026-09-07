@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -137,6 +138,8 @@ impl Agent {
          */
 
         let mut tool_calls_history: Vec<String> = Vec::new();
+        // Per-turn same-call dedup: repeat returns the cached result + nudge.
+        let mut seen: HashMap<String, String> = HashMap::new();
 
         for step in 1..=self.config.max_steps {
             if self.config.verbose {
@@ -251,7 +254,18 @@ impl Agent {
                     println!("   ↳ {name}");
                 }
 
-                let result = self.dispatch_tool(call, &request_id).await?;
+                // Loop guard: identical tool+args once per turn.
+                let dedup_args = normalize_tool_arguments(&call.function.arguments)?;
+                let dedup_k = dedup_key(name, &dedup_args);
+                let result = if let Some(cached) = seen.get(&dedup_k) {
+                    format!(
+                        "{cached} (duplicate call deduped — retry with different arguments if needed)"
+                    )
+                } else {
+                    let out = self.dispatch_tool(call, &request_id).await?;
+                    seen.insert(dedup_k, out.clone());
+                    out
+                };
 
                 if self.config.verbose {
                     println!("   ✓ {name} completado");
@@ -285,24 +299,11 @@ impl Agent {
             "{} Base de datos: {}.",
             SYSTEM_PROMPT, self.config.database_name
         );
-        // Inject valid schema memory hints (TTL filtered)
-        let valid_hints: Vec<String> = session
-            .schema_memory
-            .iter()
-            .filter(|(_, e)| !e.is_expired())
-            .map(|(k, e)| {
-                format!(
-                    "{} -> {}.{} (synonyms: {})",
-                    k,
-                    e.table.schema,
-                    e.table.table,
-                    e.synonyms.join(", ")
-                )
-            })
-            .collect();
-        if !valid_hints.is_empty() {
+        // Inject valid schema memory hints (TTL filtered, loop-guard capped)
+        let hint_text = build_schema_hint_text(&session.schema_memory);
+        if !hint_text.is_empty() {
             system_content.push_str("\n\nMemoria de esquema reciente:\n");
-            system_content.push_str(&valid_hints.join("\n"));
+            system_content.push_str(&hint_text);
         }
         // Anaphora hint: if question is anaphoric, remind model of prior context
         if is_anaphoric(question) && !session.messages.is_empty() {
@@ -377,6 +378,8 @@ impl Agent {
         let _ = session.persist().await;
 
         let mut tool_calls_history: Vec<String> = Vec::new();
+        // Per-turn same-call dedup: repeat returns the cached result + nudge.
+        let mut seen: HashMap<String, String> = HashMap::new();
 
         for step in 1..=self.config.max_steps {
             if self.config.verbose {
@@ -450,9 +453,20 @@ impl Agent {
                     println!("   ↳ {name}");
                 }
                 // For schema-related tools, update schema_memory before/after
-                let result = self
-                    .dispatch_tool_with_history(call, &request_id, session)
-                    .await?;
+                // Loop guard: identical tool+args once per turn.
+                let dedup_args = normalize_tool_arguments(&call.function.arguments)?;
+                let dedup_k = dedup_key(name, &dedup_args);
+                let result = if let Some(cached) = seen.get(&dedup_k) {
+                    format!(
+                        "{cached} (duplicate call deduped — retry with different arguments if needed)"
+                    )
+                } else {
+                    let out = self
+                        .dispatch_tool_with_history(call, &request_id, session)
+                        .await?;
+                    seen.insert(dedup_k, out.clone());
+                    out
+                };
                 if self.config.verbose {
                     println!("   ✓ {name} completado");
                     println!("📦 TOOL RESULT [{name}]:\n{result}");
@@ -1395,6 +1409,64 @@ pub fn format_invalid_reinject(candidates: &[TableInfo], error_msg: &str) -> Str
 /// Max tables grounded into schema memory per search tool call.
 /// Bounds the old fan-out (one describe per match) now replaced by data reuse.
 pub const MEMORY_GROUNDING_LIMIT: usize = 5;
+
+/*
+ * ====================================================================
+ * LOOP GUARD: bounded hints + same-call dedup
+ * ====================================================================
+ */
+
+/// Max schema-memory hints injected into the system prompt per turn.
+pub const MAX_HINTS: usize = 8;
+/// Max total chars of injected schema hints per turn.
+pub const MAX_HINT_CHARS: usize = 2000;
+
+/// Marker appended when hints are trimmed by count or char budget.
+pub const HINT_TRUNCATION_MARKER: &str = "\n…[hints truncated]";
+
+/// Build the bounded schema-hint text from memory.
+/// Keeps the most-recently-used valid (unexpired) entries up to 8 hints /
+/// 2000 chars; appends a truncation marker when trimmed.
+pub fn build_schema_hint_text(memory: &SchemaMemory) -> String {
+    let mut entries: Vec<_> = memory.iter().filter(|(_, e)| !e.is_expired()).collect();
+    entries.sort_by_key(|(_, e)| std::cmp::Reverse(e.last_used));
+    let trimmed_by_count = entries.len() > MAX_HINTS;
+    let lines: Vec<String> = entries
+        .into_iter()
+        .take(MAX_HINTS)
+        .map(|(k, e)| {
+            format!(
+                "{} -> {}.{} (synonyms: {})",
+                k,
+                e.table.schema,
+                e.table.table,
+                e.synonyms.join(", ")
+            )
+        })
+        .collect();
+    let mut out = lines.join("\n");
+    let mut truncated = trimmed_by_count;
+    if out.len() > MAX_HINT_CHARS {
+        let mut end = MAX_HINT_CHARS.min(out.len());
+        while end > 0 && !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
+        truncated = true;
+    }
+    if truncated {
+        out.push_str(HINT_TRUNCATION_MARKER);
+    }
+    out
+}
+
+/// Stable per-turn dedup key: tool name + NUL + canonical args JSON.
+pub fn dedup_key(tool: &str, args: &Value) -> String {
+    format!(
+        "{tool}\0{}",
+        serde_json::to_string(args).unwrap_or_default()
+    )
+}
 
 /// Group column matches by table (deduped, at most `limit` tables) and convert
 /// the already-fetched match rows into memory columns — zero DB calls.
