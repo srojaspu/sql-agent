@@ -1,9 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
 use sql_agent::{
-    agent::{Agent, Session},
+    agent::Agent,
     config::Config,
-    tui::{self, AppState, TerminalGuard},
+    tui::{self, run_tui},
 };
 use tracing_subscriber::EnvFilter;
 
@@ -56,10 +56,7 @@ async fn main() -> Result<()> {
                 &config.llm.model
             }
         );
-        println!(
-            "🗄️  SQL Server: {}:{}",
-            config.db.host, config.db.port
-        );
+        println!("🗄️  SQL Server: {}:{}", config.db.host, config.db.port);
         println!("📁 Base: {}", config.db.name);
         println!("🛡️  Solo lectura: ACTIVADO");
         println!("🔐 SQL Validator: ACTIVADO");
@@ -106,222 +103,6 @@ async fn main() -> Result<()> {
             anyhow::bail!("Falta la pregunta");
         }
     }
-}
-
-async fn run_tui(agent: Agent) -> Result<()> {
-    use crossterm::event::{self, Event as CEvent, KeyCode, KeyEventKind};
-    use ratatui::{backend::CrosstermBackend, Terminal};
-    use std::time::Duration;
-    use tokio::sync::mpsc;
-
-    let _guard = TerminalGuard::new()?;
-    let backend = CrosstermBackend::new(std::io::stdout());
-    let mut terminal = Terminal::new(backend)?;
-    terminal.clear()?;
-
-    // AppState holds Session from PR2
-    let mut app = AppState::new(Session::new());
-    if let Ok(Some(sess)) = Session::load_last().await {
-        app.session = sess;
-        app.set_status("Historial cargado — /history para ver");
-    }
-
-    let (tx, mut rx) = mpsc::channel::<tui::AppEvent>(32);
-    let agent = std::sync::Arc::new(agent);
-
-    // Event-driven render: draw once, then only after state actually changed
-    // (agent event or key). Idle 50ms ticks with no key do no draw at all.
-    terminal.draw(|f| tui::ui::draw(f, &app))?;
-    let mut last_drawn = app.version;
-
-    loop {
-        tokio::select! {
-            // Agent → UI events
-            maybe_ev = rx.recv() => {
-                if let Some(ev) = maybe_ev {
-                    let is_quit = matches!(ev, tui::AppEvent::Quit);
-                    app.handle_event(ev);
-                    if is_quit { break; }
-                    if tui::ui::needs_redraw(last_drawn, &app) {
-                        terminal.draw(|f| tui::ui::draw(f, &app))?;
-                        last_drawn = app.version;
-                    }
-                }
-            }
-            // Poll crossterm events (responsive 20ms tick with event queue draining)
-            _ = tokio::time::sleep(Duration::from_millis(20)) => {
-                let mut should_quit = false;
-                while event::poll(Duration::ZERO)? {
-                    match event::read()? {
-                        CEvent::Key(key) => {
-                            if key.kind == KeyEventKind::Release {
-                                continue;
-                            }
-                            if tui::ui::handle_key(key, &mut app) {
-                                should_quit = true;
-                                break;
-                            }
-                            match key.code {
-                                KeyCode::Enter => {
-                                    if app.is_loading {
-                                        app.set_status("⏳ Consulta en progreso, por favor espera...");
-                                        continue;
-                                    }
-                                    let input = app.input.trim().to_string();
-                                    if input.is_empty() { continue; }
-                                    let cmd = tui::ui::parse_command(&input);
-                                    match cmd {
-                                        tui::ui::Command::Quit => {
-                                            should_quit = true;
-                                            break;
-                                        }
-                                        tui::ui::Command::Clear => {
-                                            app.clear();
-                                            app.session.messages.clear();
-                                            app.clear_input();
-                                        }
-                                        tui::ui::Command::History => {
-                                            app.toggle_history();
-                                            app.clear_input();
-                                        }
-                                        tui::ui::Command::Help => {
-                                            app.toggle_help();
-                                            app.clear_input();
-                                        }
-                                        tui::ui::Command::Tables => {
-                                            app.clear_input();
-                                            app.is_loading = true;
-                                            app.set_status("Consultando tablas disponibles...");
-                                            let ag = agent.clone();
-                                            let tx2 = tx.clone();
-                                            tokio::spawn(async move {
-                                                match ag.tui_list_tables().await {
-                                                    Ok(txt) => {
-                                                        let _ = tx2.send(tui::AppEvent::AgentTool {
-                                                            name: "list_tables".into(),
-                                                            content: txt,
-                                                        }).await;
-                                                        let _ = tx2.send(tui::AppEvent::AgentDone("Tablas listadas".into())).await;
-                                                    }
-                                                    Err(e) => {
-                                                        let _ = tx2.send(tui::AppEvent::Error(e.to_string())).await;
-                                                    }
-                                                }
-                                            });
-                                        }
-                                        tui::ui::Command::Describe(tbl) => {
-                                            app.clear_input();
-                                            app.is_loading = true;
-                                            app.set_status(format!("Describiendo estructura de {tbl}..."));
-                                            let ag = agent.clone();
-                                            let tx2 = tx.clone();
-                                            let tbl2 = tbl.clone();
-                                            tokio::spawn(async move {
-                                                match ag.tui_describe(&tbl2).await {
-                                                    Ok(txt) => {
-                                                        let _ = tx2.send(tui::AppEvent::AgentTool {
-                                                            name: "describe_table".into(),
-                                                            content: txt,
-                                                        }).await;
-                                                        let _ = tx2.send(tui::AppEvent::AgentDone(format!("Estructura de {tbl2}"))).await;
-                                                    }
-                                                    Err(e) => {
-                                                        let _ = tx2.send(tui::AppEvent::Error(e.to_string())).await;
-                                                    }
-                                                }
-                                            });
-                                        }
-                                        tui::ui::Command::Refresh => {
-                                            app.clear_input();
-                                            app.is_loading = true;
-                                            app.set_status("Refrescando caché de esquema...");
-                                            let ag = agent.clone();
-                                            let tx2 = tx.clone();
-                                            tokio::spawn(async move {
-                                                ag.refresh_cache().await;
-                                                let _ = tx2.send(tui::AppEvent::AgentDone("🔄 Esquema refrescado".into())).await;
-                                            });
-                                            app.session.schema_memory.clear();
-                                        }
-                                        tui::ui::Command::Export { format, path } => {
-                                            app.clear_input();
-                                            // Export uses structured messages from app.state (not markdown parsing)
-                                            let messages = &app.messages;
-                                            let exported = match format {
-                                                tui::commands::ExportFormat::Csv => {
-                                                    tui::state::export_messages_csv(messages)
-                                                }
-                                                tui::commands::ExportFormat::Json => {
-                                                    tui::state::export_messages_json(messages)
-                                                }
-                                            };
-                                            let default_path = match format {
-                                                tui::commands::ExportFormat::Csv => "export.csv",
-                                                tui::commands::ExportFormat::Json => "export.json",
-                                            };
-                                            let file_path = path.unwrap_or_else(|| default_path.to_string());
-                                            match std::fs::write(&file_path, exported) {
-                                                Ok(_) => app.set_status(format!("Resultados exportados a {}", file_path)),
-                                                Err(e) => app.set_status(format!("Error exportando: {e}")),
-                                            }
-                                        }
-                                        tui::ui::Command::Unknown(u) => {
-                                            app.set_status(format!("Comando desconocido: {u} — escribe /help"));
-                                            app.clear_input();
-                                        }
-                                        tui::ui::Command::Message(q) => {
-                                            let q2 = q.clone();
-                                            app.clear_input();
-                                            app.handle_event(tui::AppEvent::Input(q.clone()));
-                                            app.session.push(sql_agent::llm::Message::user(q.clone()));
-                                            let ag = agent.clone();
-                                            let tx2 = tx.clone();
-                                            let mut sess_clone = app.session.clone();
-                                            tokio::spawn(async move {
-                                                let _ = tx2.send(tui::AppEvent::AgentStep { step: 1, tool: "search_schema".into() }).await;
-                                                match ag.run_with_history(&mut sess_clone, &q2).await {
-                                                    Ok(res) => {
-                                                        let _ = tx2.send(tui::AppEvent::SessionUpdate(Box::new(sess_clone))).await;
-                                                        let _ = tx2.send(tui::AppEvent::AgentDone(res)).await;
-                                                    }
-                                                    Err(e) => {
-                                                        let _ = tx2.send(tui::AppEvent::Error(e.to_string())).await;
-                                                    }
-                                                }
-                                            });
-                                        }
-                                    }
-                                }
-                                KeyCode::Backspace => {
-                                    app.pop_input();
-                                }
-                                KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == crossterm::event::KeyModifiers::SHIFT => {
-                                    app.push_input(c);
-                                }
-                                _ => {}
-                            }
-                        }
-                        CEvent::Resize(_, _) => {
-                            terminal.autoresize()?;
-                            terminal.clear()?;
-                            terminal.draw(|f| tui::ui::draw(f, &app))?;
-                            last_drawn = app.version;
-                        }
-                        _ => {}
-                    }
-                }
-                if should_quit {
-                    break;
-                }
-                if app.version != last_drawn {
-                    terminal.draw(|f| tui::ui::draw(f, &app))?;
-                    last_drawn = app.version;
-                }
-            }
-        }
-    }
-
-    Ok(())
 }
 
 // Pure helper for tests: mirrors tui::should_use_tui but uses IsTerminal trait directly

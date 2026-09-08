@@ -50,18 +50,13 @@ impl ManageConnection for TdsConnectionManager {
         connect_tds(&self.config)
     }
 
-    fn is_valid(
-        &self,
-        connection: &mut Self::Connection,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        async move {
-            connection
-                .simple_query("SELECT 1")
-                .await?
-                .into_results()
-                .await?;
-            Ok(())
-        }
+    async fn is_valid(&self, connection: &mut Self::Connection) -> Result<(), Self::Error> {
+        connection
+            .simple_query("SELECT 1")
+            .await?
+            .into_results()
+            .await?;
+        Ok(())
     }
 
     fn has_broken(&self, _connection: &mut Self::Connection) -> bool {
@@ -486,10 +481,7 @@ fn tds_config(config: &Config) -> TdsConfig {
     tds.host(&config.db.host);
     tds.port(config.db.port);
     tds.database(&config.db.name);
-    tds.authentication(AuthMethod::sql_server(
-        &config.db.user,
-        &config.db.password,
-    ));
+    tds.authentication(AuthMethod::sql_server(&config.db.user, &config.db.password));
     if config.db.trust_cert {
         tds.trust_cert();
     }
@@ -618,6 +610,4 @@ mod tests {
         assert_eq!(tcp_connect_timeout(&fb), Duration::from_secs(10));
         assert_eq!(tls_handshake_timeout(&fb), Duration::from_secs(20));
     }
-
-
 }

@@ -9,19 +9,15 @@
 //! `execute_read_tool` stays the single validation→audit→execute→format path.
 
 use anyhow::Result;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::time::Instant;
 
-use crate::{
-    database::schema::upsert_schema_memory, database::TableInfo, llm::ToolCall,
-};
+use crate::{database::schema::upsert_schema_memory, database::TableInfo, llm::ToolCall};
 
 use super::{
     core::Agent,
     format::{format_column_matches, limit_text, split_table},
-    memory::{
-        ground_memory_from_column_matches, normalize_tool_arguments, MEMORY_GROUNDING_LIMIT,
-    },
+    memory::{ground_memory_from_column_matches, normalize_tool_arguments, MEMORY_GROUNDING_LIMIT},
     session::Session,
 };
 
@@ -124,6 +120,7 @@ impl Agent {
                 ))
             }
             "execute_read_query" => self.execute_read_tool(&args, request_id).await,
+            "distinct_values" => self.distinct_values_tool(&args, request_id).await,
             other => anyhow::bail!("Tool no permitida: {other}"),
         };
         let latency_ms = started.elapsed().as_millis() as u64;
@@ -199,8 +196,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_records_tool_latency_audit() {
-        let dir =
-            std::env::temp_dir().join(format!("sql-agent-latency-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("sql-agent-latency-{}", uuid::Uuid::new_v4()));
         let path = dir.join("audit.jsonl");
         let path_str = path.to_string_lossy().to_string();
         let agent = Agent::new(dispatcher_test_config(path_str.clone()));
@@ -233,7 +229,10 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(line).expect("valid JSONL");
             if v.get("event").and_then(|e| e.as_str()) == Some("tool_latency") {
                 let payload = &v["payload"];
-                assert_eq!(payload.get("tool").and_then(|t| t.as_str()), Some("execute_read_query"));
+                assert_eq!(
+                    payload.get("tool").and_then(|t| t.as_str()),
+                    Some("execute_read_query")
+                );
                 let req = payload
                     .get("request_id")
                     .and_then(|r| r.as_str())

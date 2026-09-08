@@ -6,7 +6,6 @@
 //! and blocked SQL must never reach the DB.
 
 use async_trait::async_trait;
-use std::sync::{Arc, Mutex};
 use sql_agent::{
     agent::Agent,
     config::{AuditConfig, Config, DbConfig, LimitsConfig, LlmConfig, PolicyConfig},
@@ -17,6 +16,7 @@ use sql_agent::{
     llm::{LlmProvider, Message, ToolCall, ToolDefinition, ToolFunction},
     security::{SecurityPolicy, SqlValidator, ValidatedSql},
 };
+use std::sync::{Arc, Mutex};
 
 fn test_config() -> Config {
     Config {
@@ -206,7 +206,11 @@ async fn agent_execute_path_delivers_validated_sql_to_db() {
     let answer = agent.run("pregunta").await.expect("run must succeed");
     assert_eq!(answer, "done");
     let received = fake_db.received.lock().unwrap();
-    assert_eq!(received.len(), 1, "exactly one validated query must reach the DB");
+    assert_eq!(
+        received.len(),
+        1,
+        "exactly one validated query must reach the DB"
+    );
     assert_eq!(received[0], sql);
 }
 
@@ -221,5 +225,102 @@ async fn blocked_sql_never_reaches_db() {
     assert!(
         received.is_empty(),
         "blocked SQL must never reach the DB, got: {received:?}"
+    );
+}
+
+/// Fake LLM that emits one scripted tool call, then a final "done" message.
+/// Generalizes `FakeLlm` for any tool/args so new tool paths are testable
+/// end-to-end through the real dispatcher.
+struct FakeLlmTool {
+    calls: Mutex<usize>,
+    tool_name: String,
+    args: serde_json::Value,
+}
+
+impl FakeLlmTool {
+    fn new(tool_name: &str, args: serde_json::Value) -> Self {
+        Self {
+            calls: Mutex::new(0),
+            tool_name: tool_name.into(),
+            args,
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for FakeLlmTool {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _verbose: bool,
+    ) -> anyhow::Result<Message> {
+        let mut n = self.calls.lock().unwrap();
+        *n += 1;
+        if *n == 1 {
+            Ok(Message {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: Some("call1".into()),
+                    function: ToolFunction {
+                        name: self.tool_name.clone(),
+                        arguments: self.args.clone(),
+                    },
+                }],
+                name: None,
+                tool_call_id: None,
+            })
+        } else {
+            Ok(Message {
+                role: "assistant".into(),
+                content: "done".into(),
+                tool_calls: vec![],
+                name: None,
+                tool_call_id: None,
+            })
+        }
+    }
+}
+
+#[tokio::test]
+async fn distinct_values_delivers_read_only_sql_to_db() {
+    let fake_db = Arc::new(FakeDatabaseRepository::new());
+    let fake_llm: Arc<dyn LlmProvider> = Arc::new(FakeLlmTool::new(
+        "distinct_values",
+        serde_json::json!({"table": "dbo.entradaLote", "column": "estado"}),
+    ));
+    let agent = Agent::with_repository(test_config(), fake_llm, fake_db.clone());
+    let answer = agent
+        .run("cuales estados hay")
+        .await
+        .expect("run must succeed");
+    assert_eq!(answer, "done");
+    let received = fake_db.received.lock().unwrap();
+    assert_eq!(
+        received.len(),
+        1,
+        "exactly one distinct query must reach DB"
+    );
+    assert_eq!(
+        received[0],
+        "SELECT DISTINCT TOP 20 [estado] FROM [dbo].[entradaLote] WHERE [estado] IS NOT NULL ORDER BY [estado]"
+    );
+}
+
+#[tokio::test]
+async fn distinct_values_sensitive_column_blocked_before_db() {
+    let fake_db = Arc::new(FakeDatabaseRepository::new());
+    let fake_llm: Arc<dyn LlmProvider> = Arc::new(FakeLlmTool::new(
+        "distinct_values",
+        serde_json::json!({"table": "dbo.entradaLote", "column": "password"}),
+    ));
+    let agent = Agent::with_repository(test_config(), fake_llm, fake_db.clone());
+    let answer = agent.run("pregunta").await.expect("run must answer");
+    assert_eq!(answer, "done");
+    let received = fake_db.received.lock().unwrap();
+    assert!(
+        received.is_empty(),
+        "sensitive distinct must never reach the DB, got: {received:?}"
     );
 }

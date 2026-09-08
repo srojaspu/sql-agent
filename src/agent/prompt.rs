@@ -72,6 +72,10 @@ FEW-SHOTS NEUTROS (PATRONES — LOS NOMBRES SON ILUSTRATIVOS, DESCUBRE LOS REALE
 - Ejemplo 2 (JOIN + GROUP BY): "cuántos pedidos por cliente" → `SELECT c.nombre, COUNT(*) AS cantidad FROM store.Pedidos p JOIN store.Clientes c ON p.cliente_id = c.id GROUP BY c.nombre ORDER BY cantidad DESC`.
 - Ejemplo 3 (filtro verificado): "pedidos de enero" → primero `describe_table` confirma la columna `fecha`; luego `SELECT TOP 20 id, estado, fecha FROM store.Pedidos WHERE fecha >= '2026-01-01' AND fecha < '2026-02-01'`.
 - Ejemplo 4 (sin datos): tras explorar de verdad y obtener 0 filas, responde en texto plano qué buscaste y que no hay datos; nunca fabriques JSON ni atribuyas el dominio a otra tabla.
+- Ejemplo 5 (suma/promedio): "cuánto facturé" o "precio promedio" → `SELECT SUM(monto) AS total, AVG(monto) AS promedio FROM store.Pedidos`.
+- Ejemplo 6 (agrupar por mes): "cuántos pedidos por mes" → `SELECT YEAR(fecha) AS anio, MONTH(fecha) AS mes, COUNT(*) AS cantidad FROM store.Pedidos GROUP BY YEAR(fecha), MONTH(fecha) ORDER BY anio, mes`.
+- Ejemplo 7 (rango temporal con la fecha de hoy): para "este mes", "ayer" o "última semana", convertí la fecha actual inyectada arriba en un rango concreto en el WHERE. "Este mes": `WHERE fecha >= 'AAAA-MM-01' AND fecha < 'AAAA-MM-DD'` (reemplazá AAAA-MM-DD por hoy). NO uses GETDATE() ni funciones de reloj: están bloqueadas.
+- Ejemplo 8 (valores posibles de una categoría): antes de filtrar por un valor literal (ej. `estado = 'cancelado'`), descubrí los valores reales con `distinct_values` (o `GROUP BY`) y usá solo valores verificados.
 
 REGLAS DE PRESENTACIÓN / FORMATO (TUI — TEXTO PLANO):
 
@@ -168,6 +172,10 @@ FEW-SHOTS NEUTROS (PATRONES — LOS NOMBRES SON ILUSTRATIVOS, DESCUBRE LOS REALE
 - Ejemplo 2 (JOIN + GROUP BY): "cuántos pedidos por cliente" → `SELECT c.nombre, COUNT(*) AS cantidad FROM store.Pedidos p JOIN store.Clientes c ON p.cliente_id = c.id GROUP BY c.nombre ORDER BY cantidad DESC`.
 - Ejemplo 3 (filtro verificado): "pedidos de enero" → primero `describe_table` confirma la columna `fecha`; luego `SELECT TOP 20 id, estado, fecha FROM store.Pedidos WHERE fecha >= '2026-01-01' AND fecha < '2026-02-01'`.
 - Ejemplo 4 (sin datos): tras explorar de verdad y obtener 0 filas, responde en texto plano qué buscaste y que no hay datos; nunca fabriques JSON ni atribuyas el dominio a otra tabla.
+- Ejemplo 5 (suma/promedio): "cuánto facturé" o "precio promedio" → `SELECT SUM(monto) AS total, AVG(monto) AS promedio FROM store.Pedidos`.
+- Ejemplo 6 (agrupar por mes): "cuántos pedidos por mes" → `SELECT YEAR(fecha) AS anio, MONTH(fecha) AS mes, COUNT(*) AS cantidad FROM store.Pedidos GROUP BY YEAR(fecha), MONTH(fecha) ORDER BY anio, mes`.
+- Ejemplo 7 (rango temporal con la fecha de hoy): para "este mes", "ayer" o "última semana", convertí la fecha actual inyectada arriba en un rango concreto en el WHERE. "Este mes": `WHERE fecha >= 'AAAA-MM-01' AND fecha < 'AAAA-MM-DD'` (reemplazá AAAA-MM-DD por hoy). NO uses GETDATE() ni funciones de reloj: están bloqueadas.
+- Ejemplo 8 (valores posibles de una categoría): antes de filtrar por un valor literal (ej. `estado = 'cancelado'`), descubrí los valores reales con `distinct_values` (o `GROUP BY`) y usá solo valores verificados.
 
 REGLAS DE PRESENTACIÓN / FORMATO (TUI — TEXTO PLANO):
 
@@ -207,6 +215,25 @@ pub fn system_prompt(max_steps: usize) -> String {
     SYSTEM_PROMPT_TEMPLATE.replace("{max_steps}", &max_steps.to_string())
 }
 
+/// Build the current-date grounding line for temporal questions.
+///
+/// Pure over an explicit date so tests stay deterministic; the machine-local
+/// wrapper [`current_date_grounding`] is what the agent injects at
+/// system-message assembly. Kept OUTSIDE `system_prompt()` so the golden
+/// snapshot and the static `SYSTEM_PROMPT` const stay static.
+pub fn date_grounding_line(now: chrono::NaiveDate) -> String {
+    format!(
+        "Fecha actual (hoy): {now}. Para preguntas temporales (hoy, este mes, ayer, \
+         última semana, este año) convertí a un rango concreto de fechas en el WHERE \
+         usando la fecha de hoy (ej: col >= 'AAAA-MM-DD' AND col < 'AAAA-MM-DD')."
+    )
+}
+
+/// Current-date grounding using the machine's local date.
+pub fn current_date_grounding() -> String {
+    date_grounding_line(chrono::Local::now().date_naive())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,7 +242,9 @@ mod tests {
     fn prompt_contains_grounding_no_invent() {
         assert!(
             SYSTEM_PROMPT.contains(GROUNDING_NO_INVENT)
-                || SYSTEM_PROMPT.to_ascii_lowercase().contains(&GROUNDING_NO_INVENT.to_ascii_lowercase()),
+                || SYSTEM_PROMPT
+                    .to_ascii_lowercase()
+                    .contains(&GROUNDING_NO_INVENT.to_ascii_lowercase()),
             "prompt must contain grounding 'NO inventes nombres de tabla', got: {}",
             &SYSTEM_PROMPT[..200.min(SYSTEM_PROMPT.len())]
         );
@@ -232,12 +261,16 @@ mod tests {
     fn prompt_blocks_zero_match() {
         assert!(
             SYSTEM_PROMPT.contains(GROUNDING_ZERO_MATCH)
-                && SYSTEM_PROMPT.to_ascii_lowercase().contains(GROUNDING_SEARCH_SCHEMA),
+                && SYSTEM_PROMPT
+                    .to_ascii_lowercase()
+                    .contains(GROUNDING_SEARCH_SCHEMA),
             "prompt must mention 0-match stop rule"
         );
         let did_you_mean_variants = [GROUNDING_DID_YOU_MEAN, "Did-you-mean"];
         assert!(
-            did_you_mean_variants.iter().any(|v| SYSTEM_PROMPT.contains(v)),
+            did_you_mean_variants
+                .iter()
+                .any(|v| SYSTEM_PROMPT.contains(v)),
             "prompt must mention Did you mean for 0 results, got prompt without it"
         );
     }
@@ -254,7 +287,9 @@ mod tests {
             "prompt must mention describe_table and execute_read_query"
         );
         assert!(
-            SYSTEM_PROMPT.to_ascii_lowercase().contains(GROUNDING_QUALIFIED_NAME)
+            SYSTEM_PROMPT
+                .to_ascii_lowercase()
+                .contains(GROUNDING_QUALIFIED_NAME)
                 || SYSTEM_PROMPT.to_ascii_lowercase().contains("qualified"),
             "prompt must require qualified name (schema.tabla)"
         );
@@ -300,7 +335,8 @@ mod tests {
             "prompt must give generic schema-first discovery guidance"
         );
         assert!(
-            SYSTEM_PROMPT.contains(GROUNDING_SEARCH_SCHEMA) && SYSTEM_PROMPT.contains("search_columns"),
+            SYSTEM_PROMPT.contains(GROUNDING_SEARCH_SCHEMA)
+                && SYSTEM_PROMPT.contains("search_columns"),
             "prompt must point at the generic discovery tools"
         );
         assert!(
@@ -397,5 +433,22 @@ mod tests {
             p8.contains("MAX_STEPS (8)"),
             "default budget must still render"
         );
+    }
+
+    #[test]
+    fn date_grounding_line_is_deterministic_and_hints_date_range() {
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 9, 8).expect("valid date");
+        let line = date_grounding_line(d);
+        assert!(line.contains("2026-09-08"), "date must appear, got: {line}");
+        assert!(
+            line.contains("Fecha actual"),
+            "must label the anchor as today, got: {line}"
+        );
+        assert!(
+            line.contains("WHERE"),
+            "must hint date-range filtering, got: {line}"
+        );
+        // Determinism: same input produces the same output.
+        assert_eq!(date_grounding_line(d), line);
     }
 }

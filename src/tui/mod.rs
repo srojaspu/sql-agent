@@ -4,12 +4,14 @@ pub mod draw;
 pub mod events;
 pub mod guard;
 pub mod input;
+pub mod runner;
 pub mod state;
 pub mod ui;
 
 pub use app::AppState;
 pub use events::AppEvent;
 pub use guard::TerminalGuard;
+pub use runner::run_tui;
 
 // Helper to determine if we should launch TUI (pure logic for testing)
 pub fn should_use_tui(no_tui: bool, stdout_is_tty: bool, stdin_is_tty: bool) -> bool {

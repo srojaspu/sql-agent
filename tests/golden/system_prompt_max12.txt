@@ -58,6 +58,10 @@ FEW-SHOTS NEUTROS (PATRONES — LOS NOMBRES SON ILUSTRATIVOS, DESCUBRE LOS REALE
 - Ejemplo 2 (JOIN + GROUP BY): "cuántos pedidos por cliente" → `SELECT c.nombre, COUNT(*) AS cantidad FROM store.Pedidos p JOIN store.Clientes c ON p.cliente_id = c.id GROUP BY c.nombre ORDER BY cantidad DESC`.
 - Ejemplo 3 (filtro verificado): "pedidos de enero" → primero `describe_table` confirma la columna `fecha`; luego `SELECT TOP 20 id, estado, fecha FROM store.Pedidos WHERE fecha >= '2026-01-01' AND fecha < '2026-02-01'`.
 - Ejemplo 4 (sin datos): tras explorar de verdad y obtener 0 filas, responde en texto plano qué buscaste y que no hay datos; nunca fabriques JSON ni atribuyas el dominio a otra tabla.
+- Ejemplo 5 (suma/promedio): "cuánto facturé" o "precio promedio" → `SELECT SUM(monto) AS total, AVG(monto) AS promedio FROM store.Pedidos`.
+- Ejemplo 6 (agrupar por mes): "cuántos pedidos por mes" → `SELECT YEAR(fecha) AS anio, MONTH(fecha) AS mes, COUNT(*) AS cantidad FROM store.Pedidos GROUP BY YEAR(fecha), MONTH(fecha) ORDER BY anio, mes`.
+- Ejemplo 7 (rango temporal con la fecha de hoy): para "este mes", "ayer" o "última semana", convertí la fecha actual inyectada arriba en un rango concreto en el WHERE. "Este mes": `WHERE fecha >= 'AAAA-MM-01' AND fecha < 'AAAA-MM-DD'` (reemplazá AAAA-MM-DD por hoy). NO uses GETDATE() ni funciones de reloj: están bloqueadas.
+- Ejemplo 8 (valores posibles de una categoría): antes de filtrar por un valor literal (ej. `estado = 'cancelado'`), descubrí los valores reales con `distinct_values` (o `GROUP BY`) y usá solo valores verificados.
 
 REGLAS DE PRESENTACIÓN / FORMATO (TUI — TEXTO PLANO):
 

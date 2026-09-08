@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     database::schema::{ColumnMatch, TableDetail},
-    database::{DatabaseRepository, SqlServer, TableInfo},
+    database::{queries::escape_ident, DatabaseRepository, SqlServer, TableInfo},
     llm::{default_provider, LlmProvider, Message},
     security::{SecurityPolicy, SqlValidator, ValidatedSql},
 };
@@ -16,20 +16,19 @@ use crate::audit::redaction::redact_content;
 use crate::audit::{AuditSink, FileAuditSink};
 
 use crate::agent::{
-    prompt::system_prompt,
+    prompt::{current_date_grounding, system_prompt},
     session::{build_history_context, is_anaphoric, Session, MAX_CHARS},
     tools,
 };
 
 use super::{
     format::{
-        format_history_readable, format_invalid_reinject, format_query_result,
-        format_table_detail, format_table_list, limit_text, looks_like_sql, split_table,
+        extract_sql, format_distinct_values, format_history_readable, format_invalid_reinject,
+        format_query_result, format_table_detail, format_table_list, limit_text, split_table,
+        tool_error_result,
     },
-    memory::{
-        build_schema_hint_text, dedup_key, normalize_tool_arguments, SchemaCache,
-    },
-    ranking::{search_with_fallback_masked, NormalizedEntry, strip_accents},
+    memory::{build_schema_hint_text, dedup_key, normalize_tool_arguments, SchemaCache},
+    ranking::{is_table_inventory_question, search_with_fallback_masked, NormalizedEntry},
 };
 
 pub struct Agent {
@@ -47,8 +46,7 @@ impl Agent {
     }
 
     pub fn with_llm(config: Config, llm: Arc<dyn LlmProvider>) -> Self {
-        let db: Arc<dyn DatabaseRepository> =
-            Arc::new(SqlServer::new(config.clone()));
+        let db: Arc<dyn DatabaseRepository> = Arc::new(SqlServer::new(config.clone()));
         Self::with_repository(config, llm, db)
     }
 
@@ -150,9 +148,10 @@ impl Agent {
          */
 
         let system = Message::system(format!(
-            "{} Base de datos: {}.",
+            "{} Base de datos: {}.\n{}",
             system_prompt(self.config.limits.max_steps),
-            self.config.db.name
+            self.config.db.name,
+            current_date_grounding()
         ));
 
         let mut messages = vec![system, Message::user(question.to_string())];
@@ -169,7 +168,10 @@ impl Agent {
 
         for step in 1..=self.config.limits.max_steps {
             if self.config.verbose {
-                println!("\n━━━━━━━━ STEP {step}/{} ━━━━━━━━", self.config.limits.max_steps);
+                println!(
+                    "\n━━━━━━━━ STEP {step}/{} ━━━━━━━━",
+                    self.config.limits.max_steps
+                );
             }
 
             let tool_defs = tools::definitions();
@@ -195,7 +197,7 @@ impl Agent {
                  * Lo enviamos igualmente al gateway de seguridad.
                  */
 
-                if looks_like_sql(text) {
+                if let Some(sql) = extract_sql(text) {
                     if self.config.verbose {
                         println!(
                             "⚠️ SQL detectado como texto; \
@@ -206,7 +208,7 @@ impl Agent {
                     let result = self
                         .execute_read_tool(
                             &json!({
-                                "sql": text
+                                "sql": sql
                             }),
                             &request_id,
                         )
@@ -288,7 +290,12 @@ impl Agent {
                         "{cached} (duplicate call deduped — retry with different arguments if needed)"
                     )
                 } else {
-                    let out = self.dispatch_tool(call, &request_id, None).await?;
+                    let out = match self.dispatch_tool(call, &request_id, None).await {
+                        Ok(out) => out,
+                        // Recoverable: feed the error back so the model can
+                        // correct arguments within MAX_STEPS instead of aborting.
+                        Err(e) => tool_error_result(name, &e),
+                    };
                     seen.insert(dedup_k, out.clone());
                     out
                 };
@@ -315,16 +322,21 @@ impl Agent {
             }
         }
 
-        anyhow::bail!("Se alcanzó MAX_STEPS sin obtener una respuesta final")
+        Ok(
+            "⚠️ Se alcanzó el límite de pasos (MAX_STEPS) sin obtener una respuesta final. \
+            Reformulá la pregunta o aumentá MAX_STEPS."
+                .to_string(),
+        )
     }
 
     /// Build LLM messages with history, schema memory hints and caps.
     /// Pure helper for testing run_with_history without side effects.
     pub fn build_messages_with_history(&self, session: &Session, question: &str) -> Vec<Message> {
         let mut system_content = format!(
-            "{} Base de datos: {}.",
+            "{} Base de datos: {}.\n{}",
             system_prompt(self.config.limits.max_steps),
-            self.config.db.name
+            self.config.db.name,
+            current_date_grounding()
         );
         // Inject valid schema memory hints (TTL filtered, loop-guard capped)
         let hint_text = build_schema_hint_text(&session.schema_memory);
@@ -381,6 +393,44 @@ impl Agent {
         )
         .await?;
 
+        // Inventory shortcut (same as run()): answer directly without LLM
+        // so the TUI path can't hallucinate permission refusals.
+        if is_table_inventory_question(question) {
+            let tables = self.cached_tables().await?;
+            let visible: Vec<_> = tables
+                .iter()
+                .filter(|table| self.table_allowed(&table.schema, &table.table))
+                .collect();
+            let table_count = visible
+                .iter()
+                .filter(|table| table.table_type.eq_ignore_ascii_case("BASE TABLE"))
+                .count();
+            let view_count = visible
+                .iter()
+                .filter(|table| table.table_type.eq_ignore_ascii_case("VIEW"))
+                .count();
+            self.audit(
+                "response",
+                json!({
+                    "request_id": request_id,
+                    "session_id": session.id,
+                    "tools_used": ["list_tables"],
+                    "table_count": table_count,
+                    "view_count": view_count
+                }),
+            )
+            .await?;
+            let answer = format!(
+                "Objetos visibles en **{}**: **{table_count} tablas base** y **{view_count} vistas** (**{} objetos en total**).",
+                self.config.db.name,
+                table_count + view_count
+            );
+            session.push(Message::user(question.to_string()));
+            session.push(Message::assistant(answer.clone()));
+            let _ = session.persist().await;
+            return Ok(answer);
+        }
+
         // Build messages with history + caps + schema hints
         let mut messages = self.build_messages_with_history(session, question);
 
@@ -396,7 +446,10 @@ impl Agent {
 
         for step in 1..=self.config.limits.max_steps {
             if self.config.verbose {
-                println!("\n━━━━━━━━ STEP {step}/{} ━━━━━━━━", self.config.limits.max_steps);
+                println!(
+                    "\n━━━━━━━━ STEP {step}/{} ━━━━━━━━",
+                    self.config.limits.max_steps
+                );
             }
             let tool_defs = tools::definitions();
             // messages already includes system + history + question; for LLM call we use the built messages clone
@@ -409,9 +462,9 @@ impl Agent {
 
             if reply.tool_calls.is_empty() {
                 let text = reply.content.trim();
-                if looks_like_sql(text) {
+                if let Some(sql) = extract_sql(text) {
                     let result = self
-                        .execute_read_tool(&json!({ "sql": text }), &request_id)
+                        .execute_read_tool(&json!({ "sql": sql }), &request_id)
                         .await?;
                     let assistant_msg = reply.clone();
                     session.push(assistant_msg.clone());
@@ -474,9 +527,15 @@ impl Agent {
                         "{cached} (duplicate call deduped — retry with different arguments if needed)"
                     )
                 } else {
-                    let out = self
+                    let out = match self
                         .dispatch_tool(call, &request_id, Some(&mut *session))
-                        .await?;
+                        .await
+                    {
+                        Ok(out) => out,
+                        // Recoverable: feed the error back so the model can
+                        // correct arguments within MAX_STEPS instead of aborting.
+                        Err(e) => tool_error_result(name, &e),
+                    };
                     seen.insert(dedup_k, out.clone());
                     out
                 };
@@ -492,7 +551,11 @@ impl Agent {
             let _ = session.persist().await;
         }
 
-        anyhow::bail!("Se alcanzó MAX_STEPS sin obtener una respuesta final")
+        Ok(
+            "⚠️ Se alcanzó el límite de pasos (MAX_STEPS) sin obtener una respuesta final. \
+            Reformulá la pregunta o aumentá MAX_STEPS."
+                .to_string(),
+        )
     }
 
     /*
@@ -512,7 +575,10 @@ impl Agent {
     /// Returns (formatted_output, matched) so history dispatch reuses `matched`
     /// for memory without a second `search_with_fallback` call. The zero-hit
     /// top list comes from the same ranking pass (no re-rank loop).
-    pub(crate) async fn search_schema_ranked(&self, query_raw: &str) -> Result<(String, Vec<TableInfo>)> {
+    pub(crate) async fn search_schema_ranked(
+        &self,
+        query_raw: &str,
+    ) -> Result<(String, Vec<TableInfo>)> {
         let snapshot = self.cached_schema().await?;
         let tables: &[TableInfo] = &snapshot.tables;
         let norm: &[NormalizedEntry] = &snapshot.normalized;
@@ -670,6 +736,84 @@ impl Agent {
             .collect())
     }
 
+    /// Discover the distinct values of a verified column (SG-1). Builds a safe
+    /// `SELECT DISTINCT TOP N col FROM table ORDER BY col` and routes it through
+    /// the same validator/execution path as `execute_read_query`, so allowlist,
+    /// sensitive-column, system-table and read-only rules all apply identically.
+    pub(crate) async fn distinct_values_tool(
+        &self,
+        args: &Value,
+        request_id: &str,
+    ) -> Result<String> {
+        let table = args
+            .get("table")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let column = args
+            .get("column")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+
+        if table.is_empty() {
+            anyhow::bail!("Falta table");
+        }
+        if column.is_empty() {
+            anyhow::bail!("Falta column");
+        }
+
+        let (schema, name) = split_table(table);
+        if !self.table_allowed(&schema, &name) {
+            anyhow::bail!("Tabla no permitida: {table}");
+        }
+
+        let sql = distinct_values_sql(
+            &schema,
+            &name,
+            column,
+            self.config.limits.max_schema_results,
+        );
+
+        // Same validator gate as execute_read_query.
+        let validated = match ValidatedSql::parse(&self.validator, &sql) {
+            Ok(v) => v,
+            Err(crate::error::ValidationBlocked::Blocked(msg)) => {
+                return Ok(format!(
+                    "❌ Consulta bloqueada por política de seguridad: {msg}"
+                ));
+            }
+        };
+
+        self.audit(
+            "sql_approved",
+            json!({
+                "request_id": request_id,
+                "sql": if self.config.audit.capture_sql {
+                    json!(redact_content(validated.as_str()))
+                } else {
+                    json!("[REDACTED]")
+                }
+            }),
+        )
+        .await?;
+
+        let result = match self.db.execute_read(validated).await {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(format!(
+                    "❌ Error de SQL Server: {e}\n\
+                     Verificá que la columna '{column}' exista en {schema}.{name} (usa describe_table)."
+                ));
+            }
+        };
+
+        Ok(limit_text(
+            &format_distinct_values(&result.rows, column),
+            self.config.limits.max_tool_result_chars,
+        ))
+    }
+
     /*
      * ================================================================
      * EXECUTE READ QUERY
@@ -773,7 +917,10 @@ impl Agent {
          */
         let formatted = format_query_result(&result.rows, result.truncated);
 
-        Ok(limit_text(&formatted, self.config.limits.max_tool_result_chars))
+        Ok(limit_text(
+            &formatted,
+            self.config.limits.max_tool_result_chars,
+        ))
     }
 
     /*
@@ -824,7 +971,18 @@ impl Agent {
     pub async fn refresh_cache(&self) {
         *self.schema.write().await = None;
     }
+}
 
+/// Build the read-only `SELECT DISTINCT TOP N col` query for a verified column.
+/// Pure helper so the exact escaped query text is unit-testable without a DB.
+/// Both identifiers are bracket-escaped (doubling `]`); the column is repeated
+/// in the WHERE and ORDER BY so NULLs are dropped and values sort deterministically.
+fn distinct_values_sql(schema: &str, table: &str, column: &str, limit: usize) -> String {
+    let qualified = format!("{}.{}", escape_ident(schema), escape_ident(table));
+    let col = escape_ident(column);
+    format!(
+        "SELECT DISTINCT TOP {limit} {col} FROM {qualified} WHERE {col} IS NOT NULL ORDER BY {col}"
+    )
 }
 
 #[cfg(test)]
@@ -1024,6 +1182,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_messages_injects_current_date_grounding() {
+        let agent = Agent::new(dummy_config());
+        let session = crate::agent::session::Session::new();
+        let msgs = agent.build_messages_with_history(&session, "cuantos lotes este mes");
+        assert!(
+            msgs[0].content.contains("Fecha actual"),
+            "system prompt must carry the current-date anchor, got: {}",
+            &msgs[0].content[..200.min(msgs[0].content.len())]
+        );
+    }
+
     #[tokio::test]
     async fn run_with_history_refresh_clears_memory_and_cache() {
         let agent = Agent::new(dummy_config());
@@ -1151,7 +1321,7 @@ mod tests {
         );
     }
 
-#[test]
+    #[test]
     fn build_messages_uses_dynamic_max_steps() {
         let mut cfg = dummy_config();
         cfg.limits.max_steps = 12;
@@ -1177,18 +1347,54 @@ mod tests {
         assert!(!is_table_inventory_question("muestra productos"));
         assert!(!is_table_inventory_question("hola"));
     }
-}
 
-fn is_table_inventory_question(question: &str) -> bool {
-    let normalized = strip_accents(&question.to_ascii_lowercase());
-    let asks_for_count = normalized.contains("cuanto")
-        || normalized.contains("cuantos")
-        || normalized.contains("cuantas")
-        || normalized.contains("numero")
-        || normalized.contains("total");
-    let asks_for_tables = normalized.contains("tabla")
-        || normalized.contains("tablas")
-        || normalized.contains("vista")
-        || normalized.contains("vistas");
-    asks_for_count && asks_for_tables
+    #[test]
+    fn distinct_values_sql_is_read_only_and_escaped() {
+        let sql = distinct_values_sql("dbo", "Mi]Tabla", "estado", 20);
+        assert!(sql.starts_with("SELECT DISTINCT TOP 20"), "got: {sql}");
+        assert!(
+            sql.contains("[estado]"),
+            "column must be escaped, got: {sql}"
+        );
+        assert!(
+            sql.contains("[Mi]]Tabla]"),
+            "table must be escaped, got: {sql}"
+        );
+        assert!(
+            sql.contains("WHERE [estado] IS NOT NULL") && sql.contains("ORDER BY [estado]"),
+            "must drop NULLs and sort, got: {sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_values_tool_bails_on_missing_args_without_db() {
+        let agent = Agent::new(dummy_config());
+        assert!(agent
+            .distinct_values_tool(&serde_json::json!({}), "req-dv")
+            .await
+            .is_err());
+        assert!(agent
+            .distinct_values_tool(&serde_json::json!({"table": "", "column": "x"}), "req-dv")
+            .await
+            .is_err());
+        assert!(agent
+            .distinct_values_tool(
+                &serde_json::json!({"table": "dbo.T", "column": ""}),
+                "req-dv"
+            )
+            .await
+            .is_err());
+
+        // Allowlist gate: a table outside the allowlist bails before any DB call.
+        let mut cfg = dummy_config();
+        cfg.policy.allowed_tables = vec!["dbo.allowed".to_string()];
+        let restricted = Agent::new(cfg);
+        assert!(restricted
+            .distinct_values_tool(
+                &serde_json::json!({"table": "dbo.other", "column": "x"}),
+                "req-dv"
+            )
+            .await
+            .is_err());
+    }
 }

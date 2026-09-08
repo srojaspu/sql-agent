@@ -55,6 +55,14 @@ pub fn definitions() -> Vec<ToolDefinition> {
                 parameters: object(&[("query", "string", true)]),
             },
         },
+        ToolDefinition {
+            r#type: "function",
+            function: FunctionDefinition {
+                name: "distinct_values",
+                description: "Obtiene los valores distintos de una columna ya verificada (tabla calificada exacta + columna real). Úsalo para descubrir categorías/estados/roles reales antes de filtrar por un valor literal en el WHERE.",
+                parameters: object(&[("table", "string", true), ("column", "string", true)]),
+            },
+        },
     ]
 }
 
@@ -63,9 +71,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn definitions_has_five_tools() {
+    fn definitions_has_six_tools() {
         let defs = definitions();
-        assert_eq!(defs.len(), 5);
+        assert_eq!(defs.len(), 6);
     }
 
     #[test]
@@ -79,7 +87,8 @@ mod tests {
                 "describe_table",
                 "execute_read_query",
                 "list_tables",
-                "search_columns"
+                "search_columns",
+                "distinct_values"
             ]
         );
     }
@@ -132,5 +141,35 @@ mod tests {
             .cloned()
             .unwrap_or_default();
         assert_eq!(props.get("type").and_then(|t| t.as_str()), Some("string"));
+    }
+
+    #[test]
+    fn distinct_values_requires_table_and_column() {
+        let defs = definitions();
+        let params = &defs[5].function.parameters;
+        let required = params
+            .get("required")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            required.iter().any(|v| v == "table") && required.iter().any(|v| v == "column"),
+            "distinct_values must require table+column, got: {params}"
+        );
+        let props = params.get("properties").cloned().unwrap_or_default();
+        assert_eq!(
+            props
+                .get("table")
+                .and_then(|t| t.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("string")
+        );
+        assert_eq!(
+            props
+                .get("column")
+                .and_then(|t| t.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("string")
+        );
     }
 }

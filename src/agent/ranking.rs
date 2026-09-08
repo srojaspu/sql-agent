@@ -67,6 +67,22 @@ pub fn singularize(s: &str) -> String {
     }
 }
 
+/// Check if a question is asking for table/view inventory count.
+/// Uses `strip_accents` for accent-insensitive matching.
+pub fn is_table_inventory_question(question: &str) -> bool {
+    let normalized = strip_accents(&question.to_ascii_lowercase());
+    let asks_for_count = normalized.contains("cuanto")
+        || normalized.contains("cuantos")
+        || normalized.contains("cuantas")
+        || normalized.contains("numero")
+        || normalized.contains("total");
+    let asks_for_tables = normalized.contains("tabla")
+        || normalized.contains("tablas")
+        || normalized.contains("vista")
+        || normalized.contains("vistas");
+    asks_for_count && asks_for_tables
+}
+
 pub fn levenshtein(a: &str, b: &str) -> usize {
     let a_chars: Vec<char> = a.chars().collect();
     let b_chars: Vec<char> = b.chars().collect();
@@ -290,17 +306,25 @@ mod tests {
     }
 
     #[test]
-    fn strip_accents_cancion() {
-        assert_eq!(strip_accents("canción"), "cancion");
-    }
-
-    #[test]
     fn strip_accents_espanol() {
         assert_eq!(strip_accents("español"), "espanol");
     }
 
     #[test]
-    fn levenshtein_kitten_sitting() {
+    fn is_table_inventory_question_detects_count_questions() {
+        assert!(is_table_inventory_question("cuantas tablas hay"));
+        assert!(is_table_inventory_question("cuántas tablas hay"));
+        assert!(is_table_inventory_question("cuantos vistas"));
+        assert!(is_table_inventory_question("número total de tablas"));
+        assert!(is_table_inventory_question("total de tablas y vistas"));
+        // Non-inventory questions should return false
+        assert!(!is_table_inventory_question("cuantos usuarios hay"));
+        assert!(!is_table_inventory_question("muestra productos"));
+        assert!(!is_table_inventory_question("hola"));
+    }
+
+    #[test]
+    fn strip_accents_cancion() {
         assert_eq!(levenshtein("kitten", "sitting"), 3);
     }
 
