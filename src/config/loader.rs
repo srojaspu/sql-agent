@@ -7,8 +7,8 @@
 
 use anyhow::{Context, Result};
 
-use super::{AppConfig, AuditConfig, DbConfig, LimitsConfig, LlmConfig, PolicyConfig};
 use super::db::sanitize_db_name;
+use super::{AppConfig, AuditConfig, DbConfig, LimitsConfig, LlmConfig, PolicyConfig};
 use crate::util::normalize_table_name;
 
 impl AppConfig {
@@ -55,11 +55,7 @@ impl AppConfig {
                 ollama_url: get_default_map(map, "OLLAMA_URL", "http://127.0.0.1:11434"),
                 ollama_model: get_default_map(map, "OLLAMA_MODEL", "qwen3:4b"),
                 timeout_s: parse_u64_map(map, "OLLAMA_TIMEOUT_SECONDS", 120)?,
-                connect_timeout_s: parse_u64_map(
-                    map,
-                    "OLLAMA_CONNECT_TIMEOUT_SECONDS",
-                    5,
-                )?,
+                connect_timeout_s: parse_u64_map(map, "OLLAMA_CONNECT_TIMEOUT_SECONDS", 5)?,
                 temperature: get_default_map(map, "OLLAMA_TEMPERATURE", "0.0")
                     .parse()
                     .context("OLLAMA_TEMPERATURE inválido")?,
@@ -201,9 +197,7 @@ impl AppConfig {
                 key.as_str(),
                 "OPENAI_API_KEY" | "GOOGLE_API_KEY" | "ANTHROPIC_API_KEY"
             ) {
-                anyhow::bail!(
-                    "{key} ya no es compatible; use LLM_API_KEY con LLM_PROVIDER"
-                );
+                anyhow::bail!("{key} ya no es compatible; use LLM_API_KEY con LLM_PROVIDER");
             }
             if known_set.contains(key.as_str()) {
                 continue;

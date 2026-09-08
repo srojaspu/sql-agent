@@ -5,5 +5,5 @@
 //! [`super::draw`] (needs_redraw + draw + render_content_lines + handle_key).
 //! This module keeps every existing `tui::ui::` path resolving.
 
-pub use super::commands::{Command, HELP_TEXT, parse_command};
+pub use super::commands::{parse_command, Command, HELP_TEXT};
 pub use super::draw::{draw, handle_key, needs_redraw};

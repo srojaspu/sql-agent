@@ -44,7 +44,8 @@ mod tests {
 
     #[tokio::test]
     async fn rotate_file_keeps_last_5000() {
-        let dir = std::env::temp_dir().join(format!("sql-agent-rotate-test-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("sql-agent-rotate-test-{}", uuid::Uuid::new_v4()));
         let path = dir.join("history.jsonl");
         let mut lines = String::new();
         for i in 0..10_000 {

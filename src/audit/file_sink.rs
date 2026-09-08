@@ -20,11 +20,7 @@ pub struct AuditEvent<'a> {
 
 /// Append one redacted audit event as JSONL, rotating first when the log
 /// hits the size or line caps. Creates parent directories on demand.
-pub async fn write(
-    path: &str,
-    event: &str,
-    payload: serde_json::Value,
-) -> Result<(), AuditError> {
+pub async fn write(path: &str, event: &str, payload: serde_json::Value) -> Result<(), AuditError> {
     if let Some(parent) = std::path::Path::new(path).parent() {
         tokio::fs::create_dir_all(parent)
             .await

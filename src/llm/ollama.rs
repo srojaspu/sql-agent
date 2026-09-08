@@ -93,8 +93,7 @@ impl LlmProvider for Ollama {
             self.max_retries,
         )
         .await?;
-        let parsed: Response = serde_json::from_value(parsed)
-            .context("JSON inválido de Ollama")?;
+        let parsed: Response = serde_json::from_value(parsed).context("JSON inválido de Ollama")?;
         if !parsed.done {
             anyhow::bail!("Ollama no finalizó la respuesta");
         }

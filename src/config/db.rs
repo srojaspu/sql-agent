@@ -30,18 +30,18 @@ pub struct DbConfig {
     /// Env: `DATABASE_USER` (required, no default).
     pub user: String,
 
-/// SQL login password.
-///
-/// Env: `DATABASE_PASSWORD` (required, no default).
+    /// SQL login password.
+    ///
+    /// Env: `DATABASE_PASSWORD` (required, no default).
     pub password: String,
 
     /// Accept the server TLS certificate without chain validation.
-///
-/// Env: `DATABASE_TRUST_CERT` (default `false`).
-///
-/// Security note: defaults to `false` so production fails closed;
-/// development opts in explicitly with `true`. The read-only permission
-/// gate (`database::sqlserver`) runs regardless of this flag.
+    ///
+    /// Env: `DATABASE_TRUST_CERT` (default `false`).
+    ///
+    /// Security note: defaults to `false` so production fails closed;
+    /// development opts in explicitly with `true`. The read-only permission
+    /// gate (`database::sqlserver`) runs regardless of this flag.
     pub trust_cert: bool,
 }
 

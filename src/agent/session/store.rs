@@ -275,7 +275,10 @@ mod tests {
     fn assert_tool_calls_paired(s: &Session) {
         for m in &s.messages {
             for call in &m.tool_calls {
-                let id = call.id.clone().unwrap_or_else(|| call.function.name.clone());
+                let id = call
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| call.function.name.clone());
                 assert!(
                     s.messages.iter().any(|r| r.role == "tool"
                         && r.tool_call_id.as_deref() == Some(id.as_str())),
@@ -289,11 +292,17 @@ mod tests {
     fn remove_oldest_tool_turn_drains_oldest_whole_turn() {
         let mut s = Session::new();
         s.messages.push(Message::user("q".to_string()));
-        s.messages.extend(tool_turn("c1", "search_schema", "result one"));
-        s.messages.extend(tool_turn("c2", "search_schema", "result two"));
+        s.messages
+            .extend(tool_turn("c1", "search_schema", "result one"));
+        s.messages
+            .extend(tool_turn("c2", "search_schema", "result two"));
 
         assert!(s.remove_oldest_tool_turn(), "oldest turn must drain");
-        assert_eq!(s.messages.len(), 3, "assistant + tool of c1 removed together");
+        assert_eq!(
+            s.messages.len(),
+            3,
+            "assistant + tool of c1 removed together"
+        );
         assert!(
             !s.messages.iter().any(|m| m.content == "result one"),
             "oldest result must be gone"
@@ -316,7 +325,8 @@ mod tests {
     fn remove_oldest_tool_turn_without_turns_returns_false() {
         let mut s = Session::new();
         s.messages.push(Message::user("hello".to_string()));
-        s.messages.push(Message::tool("search_schema", "rows".to_string()));
+        s.messages
+            .push(Message::tool("search_schema", "rows".to_string()));
         assert!(
             !s.remove_oldest_tool_turn(),
             "no assistant[tool_calls] means no whole turn"

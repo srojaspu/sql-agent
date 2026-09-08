@@ -13,7 +13,10 @@ pub enum Command {
     Refresh,
     Quit,
     Help,
-    Export { format: ExportFormat, path: Option<String> },
+    Export {
+        format: ExportFormat,
+        path: Option<String>,
+    },
     Unknown(String),
     Message(String),
 }
@@ -115,28 +118,46 @@ mod tests {
     fn parse_command_export_csv_and_json() {
         assert_eq!(
             parse_command("/export csv"),
-            Command::Export { format: ExportFormat::Csv, path: None }
+            Command::Export {
+                format: ExportFormat::Csv,
+                path: None
+            }
         );
         assert_eq!(
             parse_command("/export json"),
-            Command::Export { format: ExportFormat::Json, path: None }
+            Command::Export {
+                format: ExportFormat::Json,
+                path: None
+            }
         );
         assert_eq!(
             parse_command("/export csv /tmp/out.csv"),
-            Command::Export { format: ExportFormat::Csv, path: Some("/tmp/out.csv".into()) }
+            Command::Export {
+                format: ExportFormat::Csv,
+                path: Some("/tmp/out.csv".into())
+            }
         );
         assert_eq!(
             parse_command("/export json ./export.json"),
-            Command::Export { format: ExportFormat::Json, path: Some("./export.json".into()) }
+            Command::Export {
+                format: ExportFormat::Json,
+                path: Some("./export.json".into())
+            }
         );
         // case-insensitive
         assert_eq!(
             parse_command("/export CSV"),
-            Command::Export { format: ExportFormat::Csv, path: None }
+            Command::Export {
+                format: ExportFormat::Csv,
+                path: None
+            }
         );
         assert_eq!(
             parse_command("/export Json"),
-            Command::Export { format: ExportFormat::Json, path: None }
+            Command::Export {
+                format: ExportFormat::Json,
+                path: None
+            }
         );
         // invalid format -> Unknown
         assert!(matches!(parse_command("/export xml"), Command::Unknown(_)));

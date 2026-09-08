@@ -463,7 +463,10 @@ mod tests {
         assert_eq!(parsed[0]["content"], "a,b");
         assert_eq!(parsed[1]["content"], "he said \"hello\"");
         assert_eq!(parsed[2]["content"], "line1\nline2");
-        assert_eq!(parsed[3]["content"], "code fence:\n```\nSELECT * FROM t\n```");
+        assert_eq!(
+            parsed[3]["content"],
+            "code fence:\n```\nSELECT * FROM t\n```"
+        );
     }
 
     #[test]

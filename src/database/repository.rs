@@ -14,11 +14,11 @@
 
 use async_trait::async_trait;
 
+use crate::database::sqlserver::QueryResult;
 use crate::database::{
     schema::{ColumnMatch, TableDetail},
     ColumnInfo, TableInfo,
 };
-use crate::database::sqlserver::QueryResult;
 use crate::security::ValidatedSql;
 
 /// Agent-facing database surface (object-safe, `Send + Sync` for `Arc<dyn>`).

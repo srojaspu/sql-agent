@@ -10,11 +10,7 @@ use crate::error::AuditError;
 #[async_trait::async_trait]
 pub trait AuditSink: Send + Sync {
     /// Persist one audit event with its JSON payload.
-    async fn write(
-        &self,
-        event: &str,
-        payload: serde_json::Value,
-    ) -> Result<(), AuditError>;
+    async fn write(&self, event: &str, payload: serde_json::Value) -> Result<(), AuditError>;
 }
 
 /// JSONL file sink: appends redacted events with rotation bounds.
@@ -33,11 +29,7 @@ impl FileAuditSink {
 
 #[async_trait::async_trait]
 impl AuditSink for FileAuditSink {
-    async fn write(
-        &self,
-        event: &str,
-        payload: serde_json::Value,
-    ) -> Result<(), AuditError> {
+    async fn write(&self, event: &str, payload: serde_json::Value) -> Result<(), AuditError> {
         crate::audit::file_sink::write(&self.path, event, payload).await
     }
 }
@@ -47,11 +39,7 @@ pub struct NoopAuditSink;
 
 #[async_trait::async_trait]
 impl AuditSink for NoopAuditSink {
-    async fn write(
-        &self,
-        _event: &str,
-        _payload: serde_json::Value,
-    ) -> Result<(), AuditError> {
+    async fn write(&self, _event: &str, _payload: serde_json::Value) -> Result<(), AuditError> {
         Ok(())
     }
 }
@@ -69,11 +57,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuditSink for CountingSink {
-        async fn write(
-            &self,
-            _event: &str,
-            _payload: serde_json::Value,
-        ) -> Result<(), AuditError> {
+        async fn write(&self, _event: &str, _payload: serde_json::Value) -> Result<(), AuditError> {
             self.events.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }

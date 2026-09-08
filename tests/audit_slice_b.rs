@@ -90,7 +90,11 @@ async fn fake_sink_counts_events() {
             .await
             .expect("fake write ok");
     }
-    assert_eq!(events.load(Ordering::SeqCst), 3, "fake sink must count events");
+    assert_eq!(
+        events.load(Ordering::SeqCst),
+        3,
+        "fake sink must count events"
+    );
 
     // Noop sink accepts writes and persists nothing.
     let noop = NoopAuditSink;

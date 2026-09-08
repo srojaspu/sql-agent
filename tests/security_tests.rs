@@ -196,8 +196,14 @@ fn config_alias_precedence_no_widen() {
     m.insert("ALLOWED_TABLES".into(), "dbo.allowed".into());
     m.insert("BLOCKED_TABLES".into(), "dbo.blocked".into());
     let cfg = Config::from_map(&m).unwrap();
-    assert!(cfg.policy.allowed_tables.contains(&"dbo.allowed".to_string()));
-    assert!(!cfg.policy.allowed_tables.contains(&"dbo.blocked".to_string()));
+    assert!(cfg
+        .policy
+        .allowed_tables
+        .contains(&"dbo.allowed".to_string()));
+    assert!(!cfg
+        .policy
+        .allowed_tables
+        .contains(&"dbo.blocked".to_string()));
 }
 
 #[test]

@@ -17,7 +17,7 @@ macro_rules! blocked {
         return Err(ValidationBlocked::Blocked(format!($($arg)*)))
     };
 }
-use sqlparser::{dialect::MsSqlDialect, parser::Parser, ast::Statement};
+use sqlparser::{ast::Statement, dialect::MsSqlDialect, parser::Parser};
 
 use super::expr::contains_word;
 use super::identifiers::{collect_identifiers, is_sensitive_column};

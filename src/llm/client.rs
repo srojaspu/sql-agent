@@ -99,35 +99,38 @@ where
 
     for attempt in 0..=max_retries {
         let request = make_request();
-        let response = match timeout(Duration::from_secs(timeout_seconds.max(1)), request.send())
-            .await
-        {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                last_error = format!("{provider} error de red: {e}");
-                if attempt == max_retries {
-                    anyhow::bail!("{last_error}");
+        let response =
+            match timeout(Duration::from_secs(timeout_seconds.max(1)), request.send()).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    last_error = format!("{provider} error de red: {e}");
+                    if attempt == max_retries {
+                        anyhow::bail!("{last_error}");
+                    }
+                    tracing::warn!(
+                        "Reintento {}/{} para {provider}: {e}",
+                        attempt + 1,
+                        max_retries
+                    );
+                    sleep(delay).await;
+                    delay *= 2;
+                    continue;
                 }
-                tracing::warn!("Reintento {}/{} para {provider}: {e}", attempt + 1, max_retries);
-                sleep(delay).await;
-                delay *= 2;
-                continue;
-            }
-            Err(_) => {
-                last_error = format!("Timeout HTTP de {provider}");
-                if attempt == max_retries {
-                    anyhow::bail!("{last_error}");
+                Err(_) => {
+                    last_error = format!("Timeout HTTP de {provider}");
+                    if attempt == max_retries {
+                        anyhow::bail!("{last_error}");
+                    }
+                    tracing::debug!(
+                        "Timeout reintento {}/{} para {provider}",
+                        attempt + 1,
+                        max_retries
+                    );
+                    sleep(delay).await;
+                    delay *= 2;
+                    continue;
                 }
-                tracing::debug!(
-                    "Timeout reintento {}/{} para {provider}",
-                    attempt + 1,
-                    max_retries
-                );
-                sleep(delay).await;
-                delay *= 2;
-                continue;
-            }
-        };
+            };
 
         let status = response.status();
         let body = response
@@ -159,8 +162,7 @@ where
             );
         }
 
-        return serde_json::from_str(&body)
-            .with_context(|| format!("JSON inválido de {provider}"));
+        return serde_json::from_str(&body).with_context(|| format!("JSON inválido de {provider}"));
     }
 
     anyhow::bail!("Máximo de reintentos alcanzado. Último error: {last_error}");
@@ -338,10 +340,7 @@ mod tests {
                 });
             }
         });
-        (
-            format!("http://{addr}"),
-            hits,
-        )
+        (format!("http://{addr}"), hits)
     }
 
     #[tokio::test]
@@ -358,14 +357,9 @@ mod tests {
         let client = reqwest::Client::new();
         let body = serde_json::json!({"probe": 1});
         let started = Instant::now();
-        let value = send_json_retry(
-            || client.post(url.clone()).json(&body),
-            10,
-            "stub",
-            3,
-        )
-        .await
-        .expect("third attempt succeeds");
+        let value = send_json_retry(|| client.post(url.clone()).json(&body), 10, "stub", 3)
+            .await
+            .expect("third attempt succeeds");
         assert_eq!(value["ok"], true);
         assert_eq!(hits.load(Ordering::SeqCst), 3, "exactly 3 attempts");
         assert!(
