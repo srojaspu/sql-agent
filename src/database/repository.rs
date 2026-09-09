@@ -4,13 +4,13 @@
 //! surface the agent needs: connectivity plus schema discovery plus the single
 //! validated-read path. The critical invariant lives on
 //! [`DatabaseRepository::execute_read`]: it takes a
-//! [`ValidatedSql`](crate::security::ValidatedSql) **by value**, never `&str`
+//! [`ValidatedSql`] **by value**, never `&str`
 //! or [`String`], so only validator-approved SQL can reach the driver.
 //!
 //! Production code implements this for [`SqlServer`](super::sqlserver::SqlServer)
 //! (single signature change inside `execute_read`: `validated.as_str()`).
 //! Tests implement it with a fake that records the [`ValidatedSql`] it
-//! receives and returns a canned [`QueryResult`](super::sqlserver::QueryResult).
+//! receives and returns a canned [`QueryResult`].
 
 use async_trait::async_trait;
 

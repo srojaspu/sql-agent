@@ -1,4 +1,4 @@
-//! Environment / map loading for [`AppConfig`](super::AppConfig).
+//! Environment / map loading for [`AppConfig`].
 //!
 //! Moved verbatim from the pre-split `config.rs`: every environment variable
 //! name, default, deprecated alias, validation message, and drift semantic

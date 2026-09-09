@@ -1,7 +1,7 @@
 //! Bounded JSONL audit persistence.
 //!
 //! Leaf module: imports only [`crate::audit::redaction`] and
-//! [`crate::audit::rotation`], never `agent::*`. [`write`] is the single
+//! [`crate::audit::rotation`], never `agent::*`. `write` is the single
 //! file-append path used by [`crate::audit::sink::FileAuditSink`].
 
 use serde::Serialize;
