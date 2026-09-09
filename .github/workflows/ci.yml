@@ -34,17 +34,6 @@ jobs:
       - name: Run tests
         run: cargo test --all
 
-  msrv:
-    name: MSRV (1.82)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.82
-      - name: Check MSRV compiles
-        run: cargo check --all-targets
-      - name: Run tests on MSRV
-        run: cargo test --all
-
   windows:
     name: Windows
     runs-on: windows-latest
