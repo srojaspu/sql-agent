@@ -41,6 +41,7 @@ impl LlmProvider for Google {
         messages: &[Message],
         tools: &[ToolDefinition],
         verbose: bool,
+        force_tool: bool,
     ) -> Result<Message> {
         if self.api_key.trim().is_empty() {
             anyhow::bail!("Falta LLM_API_KEY para el proveedor Google");
@@ -49,12 +50,15 @@ impl LlmProvider for Google {
             .iter()
             .find(|message| message.role == "system")
             .map(|message| json!({"parts": [{"text": message.content}]}));
-        let body = json!({
+        let mut body = json!({
             "systemInstruction": system_instruction,
             "contents": messages.iter().filter(|message| message.role != "system").map(google_content).collect::<Vec<_>>(),
             "tools": if tools.is_empty() { Value::Null } else { json!([{ "functionDeclarations": tools.iter().map(google_tool).collect::<Vec<_>>() }]) },
             "generationConfig": {"temperature": self.temperature}
         });
+        if force_tool {
+            body["toolConfig"] = json!({"functionCallingConfig": {"mode": "ANY"}});
+        }
         let started = Instant::now();
         let value = client::send_json_retry(
             || {

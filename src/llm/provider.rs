@@ -19,5 +19,6 @@ pub trait LlmProvider: Send + Sync {
         messages: &[Message],
         tools: &[ToolDefinition],
         verbose: bool,
+        force_tool: bool,
     ) -> Result<Message>;
 }

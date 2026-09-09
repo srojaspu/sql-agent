@@ -157,6 +157,7 @@ impl LlmProvider for FakeLlm {
         _messages: &[Message],
         _tools: &[ToolDefinition],
         _verbose: bool,
+        _force_tool: bool,
     ) -> anyhow::Result<Message> {
         let mut n = self.calls.lock().unwrap();
         *n += 1;
@@ -254,6 +255,7 @@ impl LlmProvider for FakeLlmTool {
         _messages: &[Message],
         _tools: &[ToolDefinition],
         _verbose: bool,
+        _force_tool: bool,
     ) -> anyhow::Result<Message> {
         let mut n = self.calls.lock().unwrap();
         *n += 1;

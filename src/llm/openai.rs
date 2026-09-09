@@ -41,16 +41,20 @@ impl LlmProvider for OpenAi {
         messages: &[Message],
         tools: &[ToolDefinition],
         verbose: bool,
+        force_tool: bool,
     ) -> Result<Message> {
         if self.api_key.trim().is_empty() {
             anyhow::bail!("Falta LLM_API_KEY para el proveedor OpenAI");
         }
-        let body = json!({
+        let mut body = json!({
             "model": self.model,
             "messages": messages.iter().map(openai_message).collect::<Vec<_>>(),
             "tools": tools.iter().map(openai_tool).collect::<Vec<_>>(),
             "temperature": self.temperature,
         });
+        if force_tool {
+            body["tool_choice"] = json!("required");
+        }
         let started = Instant::now();
         let value = client::send_json_retry(
             || {

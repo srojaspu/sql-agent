@@ -177,7 +177,7 @@ impl Agent {
             let tool_defs = tools::definitions();
             let reply = self
                 .llm
-                .chat(&messages, &tool_defs, self.config.verbose)
+                .chat(&messages, &tool_defs, self.config.verbose, step == 1)
                 .await
                 .with_context(|| format!("El proveedor LLM falló en STEP {step}"))?;
 
@@ -456,7 +456,7 @@ impl Agent {
             // But we need to keep messages mutable for loop: we already have messages built, but we need to update it each iteration
             let reply = self
                 .llm
-                .chat(&messages, &tool_defs, self.config.verbose)
+                .chat(&messages, &tool_defs, self.config.verbose, step == 1)
                 .await
                 .with_context(|| format!("El proveedor LLM falló en STEP {step}"))?;
 

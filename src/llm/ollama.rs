@@ -22,6 +22,8 @@ struct Request<'a> {
     stream: bool,
     think: bool,
     tools: &'a [ToolDefinition],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
     options: Options,
     keep_alive: &'static str,
 }
@@ -66,6 +68,7 @@ impl LlmProvider for Ollama {
         messages: &[Message],
         tools: &[ToolDefinition],
         verbose: bool,
+        force_tool: bool,
     ) -> Result<Message> {
         let req = Request {
             model: &self.model,
@@ -73,6 +76,10 @@ impl LlmProvider for Ollama {
             stream: false,
             think: false,
             tools,
+            // Force the model to emit a tool call on the first grounding step;
+            // otherwise a small model (e.g. qwen3:4b) may answer in prose with
+            // an invented schema instead of discovering it.
+            tool_choice: if force_tool { Some("required") } else { None },
             options: Options {
                 temperature: self.temperature,
             },
@@ -131,7 +138,8 @@ pub fn strip_thinking(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_thinking;
+    use super::*;
+
     #[test]
     fn removes_thinking() {
         assert_eq!(strip_thinking("<think>interno</think>4"), "4");
@@ -139,5 +147,39 @@ mod tests {
     #[test]
     fn removes_unclosed_thinking() {
         assert_eq!(strip_thinking("<think>interno"), "");
+    }
+
+    #[test]
+    fn request_serializes_tool_choice_required_when_forced() {
+        let messages = vec![Message::system("s".into())];
+        let tools: Vec<ToolDefinition> = vec![];
+        let forced = Request {
+            model: "m",
+            messages: &messages,
+            stream: false,
+            think: false,
+            tools: &tools,
+            tool_choice: Some("required"),
+            options: Options { temperature: 0.0 },
+            keep_alive: "5m",
+        };
+        let v = serde_json::to_value(&forced).unwrap();
+        assert_eq!(v["tool_choice"], "required");
+
+        let auto = Request {
+            model: "m",
+            messages: &messages,
+            stream: false,
+            think: false,
+            tools: &tools,
+            tool_choice: None,
+            options: Options { temperature: 0.0 },
+            keep_alive: "5m",
+        };
+        let v = serde_json::to_value(&auto).unwrap();
+        assert!(
+            v.get("tool_choice").is_none(),
+            "auto must omit tool_choice, got: {v}"
+        );
     }
 }
